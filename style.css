@@ -323,13 +323,28 @@ html, body {
 #si-close:hover { color: #ffe9c2; }
 
 /* --- Search bar --- */
+/* Occupy the band BETWEEN the HUD (left) and the + user button (right),
+   centered within it and capped — so it never overlaps either one. */
 #search-wrap {
   position: absolute;
   top: 16px;
-  left: 50%;
-  transform: translateX(-50%);
-  width: min(88vw, 340px);
+  left: 244px;    /* clears the HUD */
+  right: 100px;   /* clears the + user button */
+  max-width: 360px;
+  margin-inline: auto;
   z-index: 8;
+}
+
+/* Narrow screens: not enough room on the top row — drop search to its own
+   row and hide the dev KPIs so nothing overlaps. */
+@media (max-width: 640px) {
+  #search-wrap {
+    left: 16px;
+    right: 16px;
+    top: 60px;
+    max-width: none;
+  }
+  #hud { display: none; }
 }
 
 #search {

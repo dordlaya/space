@@ -30,7 +30,7 @@ const CONFIG = {
   starMinGap: 12,        // min empty space (world px) to keep between star edges
   pullFade: 3,           // how fast pullForce eases to its login target
 
-  probeRadius: 4,
+  probeRadius: 6,
   spawnInterval: 10,
   maxProbes: 10,
 
@@ -45,7 +45,7 @@ const CONFIG = {
   zoomStep: 1.25,
 
   starCounts: [140, 90, 50],
-  trailFade: 0.14,
+  trailLength: 26,       // number of recent points kept per probe for its neon trail
 };
 
 const PULL_MIN = 0.05; // below this a star is inert (no pull, no collisions)
@@ -349,6 +349,7 @@ function spawnProbe() {
     vy: Math.sin(angle) * CONFIG.maxSpeed * 0.6,
     wanderAngle: angle,
     hue: 180 + Math.random() * 80,
+    trail: [],   // recent world positions for the neon trail
   });
 }
 
@@ -501,6 +502,9 @@ function update(dt) {
     }
     p.x += p.vx * dt;
     p.y += p.vy * dt;
+
+    p.trail.push({ x: p.x, y: p.y });
+    if (p.trail.length > CONFIG.trailLength) p.trail.shift();
   }
 
   detectCollisions();
@@ -551,9 +555,9 @@ function setWorldTransform() {
 }
 
 function render(time) {
-  // --- Screen space: trail + parallax background ---
+  // --- Screen space: clear + parallax background ---
   setScreenTransform();
-  ctx.fillStyle = `rgba(5, 7, 13, ${CONFIG.trailFade})`;
+  ctx.fillStyle = '#05070d';               // full clear each frame: no smudges
   ctx.fillRect(0, 0, world.w, world.h);
 
   for (const layer of starLayers) {
@@ -591,6 +595,31 @@ function render(time) {
     ctx.fillStyle = 'rgba(150, 205, 235, 0.5)';
     ctx.fillText(`SECTOR · ${sectorName(i).toUpperCase()}`, o.x + 12 / z, o.y + 22 / z);
   }
+
+  // Neon probe trails — thin bright lines with a small additive halo (no blob).
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  for (const p of probes) {
+    const pts = p.trail;
+    if (pts.length < 2) continue;
+    ctx.shadowColor = `hsl(${p.hue}, 100%, 65%)`;
+    ctx.lineWidth = 1.6 / z;            // thin, ~constant width on screen
+    for (let i = 1; i < pts.length; i++) {
+      const t = i / (pts.length - 1);   // 0 at tail -> 1 at head
+      const A = pts[i - 1];
+      const B = pts[i];
+      ctx.strokeStyle = `hsla(${p.hue}, 100%, 82%, ${t})`;
+      ctx.shadowBlur = 6 * t;           // subtle neon halo, brighter toward head
+      ctx.beginPath();
+      ctx.moveTo(A.x, A.y);
+      ctx.lineTo(B.x, B.y);
+      ctx.stroke();
+    }
+  }
+  ctx.shadowBlur = 0;
+  ctx.shadowColor = 'transparent';
+  ctx.globalCompositeOperation = 'source-over';
 
   // Stars (users).
   for (const u of users) {
@@ -635,23 +664,29 @@ function render(time) {
     ctx.globalAlpha = 1;
   }
 
-  // Probes.
+  // Probes — glowing neon orb: soft additive halo + colored core + hot centre.
+  const R = CONFIG.probeRadius;
+  ctx.globalCompositeOperation = 'lighter';
   for (const p of probes) {
-    const glow = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, 22);
-    glow.addColorStop(0, `hsla(${p.hue}, 100%, 70%, 0.9)`);
-    glow.addColorStop(1, `hsla(${p.hue}, 100%, 70%, 0)`);
+    const glow = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, R * 3);
+    glow.addColorStop(0, `hsla(${p.hue}, 100%, 70%, 0.55)`);
+    glow.addColorStop(0.4, `hsla(${p.hue}, 100%, 62%, 0.28)`);
+    glow.addColorStop(1, `hsla(${p.hue}, 100%, 60%, 0)`);
     ctx.fillStyle = glow;
     ctx.beginPath();
-    ctx.arc(p.x, p.y, 22, 0, Math.PI * 2);
+    ctx.arc(p.x, p.y, R * 3, 0, Math.PI * 2);
     ctx.fill();
+  }
+  ctx.globalCompositeOperation = 'source-over';
 
-    ctx.fillStyle = '#eafaff';
+  for (const p of probes) {
+    ctx.fillStyle = `hsl(${p.hue}, 100%, 68%)`;
     ctx.beginPath();
-    ctx.arc(p.x, p.y, CONFIG.probeRadius, 0, Math.PI * 2);
+    ctx.arc(p.x, p.y, R, 0, Math.PI * 2);
     ctx.fill();
-    ctx.fillStyle = `hsl(${p.hue}, 100%, 70%)`;
+    ctx.fillStyle = '#f4fbff';
     ctx.beginPath();
-    ctx.arc(p.x, p.y, CONFIG.probeRadius - 1.5, 0, Math.PI * 2);
+    ctx.arc(p.x, p.y, R * 0.45, 0, Math.PI * 2);
     ctx.fill();
   }
 
