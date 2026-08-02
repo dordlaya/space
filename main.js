@@ -60,6 +60,7 @@ const ctx = canvas.getContext('2d');
 
 const world = { w: 0, h: 0 };   // viewport size in CSS pixels
 let dpr = 1;
+let uiScale = 1;                 // shrinks on-screen text/lines on small screens
 
 function resize() {
   dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -67,6 +68,9 @@ function resize() {
   world.h = window.innerHeight;
   canvas.width = Math.floor(world.w * dpr);
   canvas.height = Math.floor(world.h * dpr);
+  // Phones (small min-side) get proportionally smaller labels/strokes so the
+  // map isn't dominated by text; desktop stays at full size.
+  uiScale = clamp(Math.min(world.w, world.h) / 820, 0.62, 1);
 }
 window.addEventListener('resize', () => { resize(); starLayers = makeStars(); });
 resize();
@@ -583,8 +587,12 @@ function render(time) {
   // Sector borders + names.
   const n = sectorCount();
   const S = CONFIG.sectorSize;
-  ctx.lineWidth = 1.25 / z;
-  ctx.font = `${13 / z}px ui-monospace, monospace`;
+  const sectorOnScreen = S * z;                         // sector size in screen px
+  // Font tied to how big the sector actually appears, clamped + scaled for mobile.
+  const sectorFontPx = clamp(sectorOnScreen * 0.045, 9, 15) * uiScale;
+  const showSectorLabel = sectorOnScreen > 140 * uiScale; // hide when too small to read
+  ctx.lineWidth = (1.25 * uiScale) / z;
+  ctx.font = `${sectorFontPx / z}px ui-monospace, monospace`;
   ctx.textAlign = 'left';
   for (let i = 0; i < n; i++) {
     const o = sectorOrigin(i);
@@ -592,8 +600,11 @@ function render(time) {
     ctx.setLineDash([7 / z, 6 / z]);
     ctx.strokeRect(o.x, o.y, S, S);
     ctx.setLineDash([]);
-    ctx.fillStyle = 'rgba(150, 205, 235, 0.5)';
-    ctx.fillText(`SECTOR · ${sectorName(i).toUpperCase()}`, o.x + 12 / z, o.y + 22 / z);
+    if (showSectorLabel) {
+      ctx.fillStyle = 'rgba(150, 205, 235, 0.5)';
+      ctx.fillText(`SECTOR · ${sectorName(i).toUpperCase()}`,
+        o.x + (10 * uiScale) / z, o.y + (sectorFontPx + 9) / z);
+    }
   }
 
   // Neon probe trails — thin bright lines with a small additive halo (no blob).
@@ -655,13 +666,19 @@ function render(time) {
       ctx.setLineDash([]);
     }
 
-    ctx.globalAlpha = 0.4 + 0.5 * u.pullForce;
-    ctx.fillStyle = u.loggedIn ? '#ffe9c2' : '#8aa0ad';
-    ctx.font = `${11 / z}px ui-monospace, monospace`;
-    ctx.textAlign = 'center';
-    const tag = u.pullForce <= PULL_MIN ? ' · offline' : ` · ${u.hits}`;
-    ctx.fillText(`${u.name}${tag}`, u.x, u.y - u.r - 8 / z);
-    ctx.globalAlpha = 1;
+    // Label: proportional to the star's on-screen size, scaled for mobile, and
+    // hidden when the star is too small on screen (keeps a fit-view uncluttered).
+    const screenR = u.r * z;
+    if (screenR > 4 * uiScale || u.id === selectedUserId) {
+      const labelPx = clamp(screenR * 0.85, 8, 14) * uiScale;
+      ctx.globalAlpha = 0.4 + 0.5 * u.pullForce;
+      ctx.fillStyle = u.loggedIn ? '#ffe9c2' : '#8aa0ad';
+      ctx.font = `${labelPx / z}px ui-monospace, monospace`;
+      ctx.textAlign = 'center';
+      const tag = u.pullForce <= PULL_MIN ? ' · offline' : ` · ${u.hits}`;
+      ctx.fillText(`${u.name}${tag}`, u.x, u.y - u.r - (labelPx * 0.5 + 3) / z);
+      ctx.globalAlpha = 1;
+    }
   }
 
   // Probes — glowing neon orb: soft additive halo + colored core + hot centre.
