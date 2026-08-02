@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Space Map POC</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app">
+    <canvas id="map"></canvas>
+
+    <!-- Login page: simulate local users joining; each login drops a planet -->
+    <div id="login" class="hidden">
+      <button id="login-close" title="Close">×</button>
+      <div class="login-card">
+        <div class="login-title">SPACE MAP</div>
+        <div class="login-sub">Log in a local user — their planet drops at a random spot on the map.</div>
+
+        <label class="login-label" for="nickname">Nickname</label>
+        <input id="nickname" type="text" maxlength="16" placeholder="e.g. Nova" autocomplete="off" />
+
+        <div class="login-actions">
+          <button id="join-btn" class="btn-primary">Log in &amp; drop planet</button>
+          <button id="enter-btn" class="btn-ghost">Enter map</button>
+        </div>
+
+        <div id="user-list" class="user-list"></div>
+        <a id="reset-users" href="#" class="reset-link">Reset local users</a>
+      </div>
+    </div>
+
+    <!-- Search bar: jump to a star or sector by name -->
+    <div id="search-wrap">
+      <input id="search" type="text" placeholder="Search star or sector…" autocomplete="off" />
+      <div id="search-results" class="hidden"></div>
+    </div>
+
+    <!-- Floating button to add more local users while playing -->
+    <button id="add-user" title="Add local user">+ user</button>
+
+    <!-- Zoom controls -->
+    <div id="zoom-controls">
+      <button id="zoom-in" title="Zoom in">+</button>
+      <button id="zoom-out" title="Zoom out">−</button>
+      <button id="zoom-fit" title="Fit map">⊡</button>
+    </div>
+
+    <!-- Star details panel: opens when a star is clicked -->
+    <div id="star-info" class="hidden">
+      <button id="si-close" title="Close">×</button>
+      <div class="si-name" id="si-name">–</div>
+      <div class="si-grid">
+        <span>sector</span><span id="si-sector">–</span>
+        <span>status</span><span id="si-status">–</span>
+        <span>pull force</span><span id="si-pull">–</span>
+        <span>age</span><span id="si-age">–</span>
+        <span>probes absorbed</span><span id="si-absorbed">–</span>
+        <span>size</span><span id="si-size">–</span>
+        <span>growth</span><span id="si-growth">–</span>
+        <span>position</span><span id="si-pos">–</span>
+        <span>born</span><span id="si-born">–</span>
+      </div>
+      <button id="si-toggle" class="si-toggle">Log out</button>
+    </div>
+
+    <!-- Heads-up display: live simulation stats -->
+    <div id="hud">
+      <div class="hud-title">SPACE MAP · POC</div>
+      <div class="hud-row"><span>probes</span><span id="hud-probes">–</span></div>
+      <div class="hud-row"><span>users</span><span id="hud-users">–</span></div>
+      <div class="hud-row"><span>sectors</span><span id="hud-sectors">–</span></div>
+      <div class="hud-row"><span>collisions</span><span id="hud-collisions">–</span></div>
+      <div class="hud-row"><span>fps</span><span id="hud-fps">–</span></div>
+    </div>
+
+    <div id="hint">Drag to pan · scroll or use +/− to zoom · click a star for details · search to jump.</div>
+  </div>
+
+  <script src="main.js"></script>
+</body>
+</html>
