@@ -828,16 +828,16 @@ function refreshLoginUI() {
 }
 
 function doJoin() {
-  const u = loginUser(login.nickname.value);
+  loginUser(login.nickname.value);
   login.nickname.value = '';
   hideLogin();
   refreshLoginUI();
-  focusStar(u);
+  fitView(); // open the map at the fit-all view
 }
 
 login.join.addEventListener('click', doJoin);
 login.nickname.addEventListener('keydown', (e) => { if (e.key === 'Enter') doJoin(); });
-login.enter.addEventListener('click', () => { hideLogin(); refreshLoginUI(); });
+login.enter.addEventListener('click', () => { hideLogin(); refreshLoginUI(); fitView(); });
 login.close.addEventListener('click', hideLogin);
 login.addBtn.addEventListener('click', showLogin);
 login.reset.addEventListener('click', (e) => {
