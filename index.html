@@ -77,6 +77,10 @@
     <div id="hint">Drag to pan · scroll or use +/− to zoom · click a star for details · search to jump.</div>
   </div>
 
+  <!-- PixiJS v8 (WebGL/WebGPU renderer), global UMD build exposing `PIXI`.
+       Loaded from CDN for local dev; vendor a local copy (e.g. vendor/pixi.min.js)
+       before building the offline k3s image. -->
+  <script src="https://cdn.jsdelivr.net/npm/pixi.js@8.19.0/dist/pixi.min.js"></script>
   <script src="main.js"></script>
 </body>
 </html>

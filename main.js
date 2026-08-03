@@ -53,27 +53,166 @@ const PULL_MIN = 0.05; // below this a star is inert (no pull, no collisions)
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
 // ---------------------------------------------------------------------------
-// Canvas setup (handles high-DPI screens + resize)
+// Renderer — PixiJS v8 (WebGL/WebGPU). We keep our own update()/loop and drive
+// drawing manually (autoStart:false); ONLY the draw layer is Pixi. All
+// simulation, camera math, persistence and HTML UI stay exactly as before.
+// v8 note: app.init() is async, so the renderer-owned objects are created in
+// bootstrap() below and the render loop only starts once init resolves.
 // ---------------------------------------------------------------------------
 const canvas = document.getElementById('map');
-const ctx = canvas.getContext('2d');
 
-const world = { w: 0, h: 0 };   // viewport size in CSS pixels
-let dpr = 1;
+const world = { w: window.innerWidth, h: window.innerHeight };  // CSS pixels
+let dpr = Math.min(window.devicePixelRatio || 1, 2);
 let uiScale = 1;                 // shrinks on-screen text/lines on small screens
+
+const app = new PIXI.Application();   // v8: construct empty, configure via init()
+let rendererReady = false;
+
+// Renderer-owned display objects (assigned in bootstrap() after app.init()).
+let glowTex;
+let bgLayer, worldLayer;
+let sectorGfx, sectorLabelLayer, trailGfx, starGlowLayer, starGfx,
+  starLabelLayer, probeGlowLayer, probeGfx, seekGfx;
+
+// --- Pools (reuse display objects; hide extras instead of destroying) ---
+const starGlowPool = [];
+const probeGlowPool = [];
+const sectorLabelPool = [];
+const starLabelPool = [];
+let bgStars = [];
+
+// Soft radial texture reused for every glow (stars, probes, background dots).
+function makeGlowTexture() {
+  const size = 128;
+  const c = document.createElement('canvas');
+  c.width = c.height = size;
+  const g = c.getContext('2d');
+  const grd = g.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+  grd.addColorStop(0.0, 'rgba(255,255,255,1)');
+  grd.addColorStop(0.35, 'rgba(255,255,255,0.45)');
+  grd.addColorStop(1.0, 'rgba(255,255,255,0)');
+  g.fillStyle = grd;
+  g.fillRect(0, 0, size, size);
+  return PIXI.Texture.from(c);
+}
+
+function makeGlowSprite() {
+  const s = new PIXI.Sprite(glowTex);
+  s.anchor.set(0.5);
+  s.blendMode = 'add';           // v8: blend modes are strings
+  return s;
+}
+function ensureSprites(layer, pool, n) {
+  while (pool.length < n) { const s = makeGlowSprite(); pool.push(s); layer.addChild(s); }
+  for (let i = n; i < pool.length; i++) pool[i].visible = false;
+}
+function ensureLabels(layer, pool, n, anchorX, anchorY) {
+  while (pool.length < n) {
+    // v8: options-object constructor. White fill so we can recolour via tint.
+    const t = new PIXI.Text({
+      text: '',
+      style: { fontFamily: 'ui-monospace, monospace', fontSize: 16, fill: 0xffffff },
+      resolution: 2,
+    });
+    t.anchor.set(anchorX, anchorY);
+    pool.push(t);
+    layer.addChild(t);
+  }
+  for (let i = n; i < pool.length; i++) pool[i].visible = false;
+}
+// Update a pooled label's text/colour ONLY when it changes — v8 Text re-rasterises
+// on every .text / .style change, so we guard to keep per-frame cost near zero.
+function setLabel(t, text, fill) {
+  if (t._txt !== text) { t.text = text; t._txt = text; }
+  if (t._fill !== fill) { t.style.fill = fill; t._fill = fill; }
+}
+
+// HSL (matches the old hsl() trail/probe colours) -> 0xRRGGBB for Pixi tint.
+function hsl2hex(h, s, l) {
+  s /= 100; l /= 100;
+  const k = (n) => (n + h / 30) % 12;
+  const a = s * Math.min(l, 1 - l);
+  const f = (n) => l - a * Math.max(-1, Math.min(k(n) - 3, 9 - k(n), 1));
+  const to = (v) => Math.round(255 * v);
+  return (to(f(0)) << 16) | (to(f(8)) << 8) | to(f(4));
+}
+
+// Background starfield as soft additive sprites (rebuilt on resize).
+function buildBackground() {
+  for (const c of bgLayer.removeChildren()) c.destroy();
+  bgStars = [];
+  for (const layer of makeStars()) {
+    for (const s of layer.stars) {
+      const sp = new PIXI.Sprite(glowTex);
+      sp.anchor.set(0.5);
+      sp.blendMode = 'add';
+      sp.tint = 0xcfe9ff;
+      sp.width = sp.height = Math.max(1.2, s.r) * 3.2;
+      bgStars.push({ sprite: sp, baseX: s.x, baseY: s.y, a: s.a, tw: s.tw, depth: layer.depth });
+      bgLayer.addChild(sp);
+    }
+  }
+}
+
+// Camera = worldLayer transform (replaces the old ctx setWorldTransform()).
+function applyCamera() {
+  worldLayer.scale.set(cam.zoom);
+  worldLayer.position.set(world.w / 2 - cam.x * cam.zoom, world.h / 2 - cam.y * cam.zoom);
+}
 
 function resize() {
   dpr = Math.min(window.devicePixelRatio || 1, 2);
   world.w = window.innerWidth;
   world.h = window.innerHeight;
-  canvas.width = Math.floor(world.w * dpr);
-  canvas.height = Math.floor(world.h * dpr);
   // Phones (small min-side) get proportionally smaller labels/strokes so the
   // map isn't dominated by text; desktop stays at full size.
   uiScale = clamp(Math.min(world.w, world.h) / 820, 0.62, 1);
+  if (!rendererReady) return;    // renderer not built yet (pre-init)
+  app.renderer.resize(world.w, world.h);
+  buildBackground();
 }
-window.addEventListener('resize', () => { resize(); starLayers = makeStars(); });
-resize();
+window.addEventListener('resize', resize);
+
+// v8 async init: build renderer + scene graph, then start the render loop.
+async function bootstrap() {
+  await app.init({
+    canvas,
+    width: world.w,
+    height: world.h,
+    background: 0x05070d,
+    antialias: true,
+    resolution: dpr,
+    autoDensity: true,
+    autoStart: false,            // we render from our own rAF loop
+  });
+
+  glowTex = makeGlowTexture();
+
+  bgLayer = new PIXI.Container();
+  worldLayer = new PIXI.Container();
+  app.stage.addChild(bgLayer, worldLayer);
+
+  sectorGfx = new PIXI.Graphics();
+  sectorLabelLayer = new PIXI.Container();
+  trailGfx = new PIXI.Graphics(); trailGfx.blendMode = 'add';
+  starGlowLayer = new PIXI.Container();
+  starGfx = new PIXI.Graphics();
+  starLabelLayer = new PIXI.Container();
+  probeGlowLayer = new PIXI.Container();
+  probeGfx = new PIXI.Graphics();
+  seekGfx = new PIXI.Graphics();
+  worldLayer.addChild(
+    sectorGfx, sectorLabelLayer, trailGfx,
+    starGlowLayer, starGfx, starLabelLayer,
+    probeGlowLayer, probeGfx, seekGfx,
+  );
+
+  rendererReady = true;
+  resize();                      // size renderer + build background
+  last = performance.now();
+  requestAnimationFrame(frame);
+}
+bootstrap();
 
 // ---------------------------------------------------------------------------
 // Sectors — every `starsPerSector` stars form a sector with a unique name,
@@ -131,7 +270,7 @@ function makeStars() {
     return { depth, stars };
   });
 }
-let starLayers = makeStars();
+// Background sprites are built by buildBackground() in the renderer setup.
 
 // ---------------------------------------------------------------------------
 // Users — persisted "local users". Position stored as a fraction (fx, fy)
@@ -547,192 +686,140 @@ function detectCollisions() {
 }
 
 // ---------------------------------------------------------------------------
-// render()
+// render() — sync the Pixi scene graph from current sim state, then draw.
 // ---------------------------------------------------------------------------
-function setScreenTransform() { ctx.setTransform(dpr, 0, 0, dpr, 0, 0); }
-function setWorldTransform() {
-  ctx.setTransform(
-    dpr * cam.zoom, 0, 0, dpr * cam.zoom,
-    dpr * (world.w / 2 - cam.x * cam.zoom),
-    dpr * (world.h / 2 - cam.y * cam.zoom),
-  );
-}
-
 function render(time) {
-  // --- Screen space: clear + parallax background ---
-  setScreenTransform();
-  ctx.fillStyle = '#05070d';               // full clear each frame: no smudges
-  ctx.fillRect(0, 0, world.w, world.h);
-
-  for (const layer of starLayers) {
-    const shiftX = (cam.x * 0.03 * layer.depth) % world.w;
-    const shiftY = (cam.y * 0.03 * layer.depth) % world.h;
-    for (const s of layer.stars) {
-      const twinkle = 0.6 + 0.4 * Math.sin(time * 0.002 + s.tw);
-      let sx = s.x - shiftX; if (sx < 0) sx += world.w;
-      let sy = s.y - shiftY; if (sy < 0) sy += world.h;
-      ctx.globalAlpha = s.a * twinkle;
-      ctx.fillStyle = '#cfe9ff';
-      ctx.beginPath();
-      ctx.arc(sx, sy, s.r, 0, Math.PI * 2);
-      ctx.fill();
-    }
-  }
-  ctx.globalAlpha = 1;
-
-  // --- World space: sectors, stars, probes ---
-  setWorldTransform();
   const z = cam.zoom;
+  applyCamera();
 
-  // Sector borders + names.
+  // --- Background starfield (screen space, parallax + twinkle) ---
+  for (const st of bgStars) {
+    const shiftX = (cam.x * 0.03 * st.depth) % world.w;
+    const shiftY = (cam.y * 0.03 * st.depth) % world.h;
+    let sx = st.baseX - shiftX; if (sx < 0) sx += world.w;
+    let sy = st.baseY - shiftY; if (sy < 0) sy += world.h;
+    st.sprite.position.set(sx, sy);
+    st.sprite.alpha = st.a * (0.6 + 0.4 * Math.sin(time * 0.002 + st.tw));
+  }
+
+  // --- Sector borders + labels ---
   const n = sectorCount();
   const S = CONFIG.sectorSize;
-  const sectorOnScreen = S * z;                         // sector size in screen px
-  // Font tied to how big the sector actually appears, clamped + scaled for mobile.
+  const sectorOnScreen = S * z;
   const sectorFontPx = clamp(sectorOnScreen * 0.045, 9, 15) * uiScale;
-  const showSectorLabel = sectorOnScreen > 140 * uiScale; // hide when too small to read
-  ctx.lineWidth = (1.25 * uiScale) / z;
-  ctx.font = `${sectorFontPx / z}px ui-monospace, monospace`;
-  ctx.textAlign = 'left';
+  const showSectorLabel = sectorOnScreen > 140 * uiScale;
+  const sectorStroke = { width: (1.25 * uiScale) / z, color: 0x78b4dc, alpha: 0.22 };
+  sectorGfx.clear();
+  ensureLabels(sectorLabelLayer, sectorLabelPool, n, 0, 0);
   for (let i = 0; i < n; i++) {
     const o = sectorOrigin(i);
-    ctx.strokeStyle = 'rgba(120, 180, 220, 0.22)';
-    ctx.setLineDash([7 / z, 6 / z]);
-    ctx.strokeRect(o.x, o.y, S, S);
-    ctx.setLineDash([]);
+    sectorGfx.rect(o.x, o.y, S, S).stroke(sectorStroke);   // v8: shape-then-stroke
+    const lbl = sectorLabelPool[i];
     if (showSectorLabel) {
-      ctx.fillStyle = 'rgba(150, 205, 235, 0.5)';
-      ctx.fillText(`SECTOR · ${sectorName(i).toUpperCase()}`,
-        o.x + (10 * uiScale) / z, o.y + (sectorFontPx + 9) / z);
+      lbl.visible = true;
+      setLabel(lbl, `SECTOR · ${sectorName(i).toUpperCase()}`, 0x96cdeb);
+      lbl.alpha = 0.55;
+      lbl.scale.set(sectorFontPx / (16 * z));         // constant screen size
+      lbl.position.set(o.x + (10 * uiScale) / z, o.y + (8 * uiScale) / z);
+    } else {
+      lbl.visible = false;
     }
   }
 
-  // Neon probe trails — thin bright lines with a small additive halo (no blob).
-  ctx.globalCompositeOperation = 'lighter';
-  ctx.lineCap = 'round';
-  ctx.lineJoin = 'round';
+  // --- Neon probe trails: additive fat halo + thin bright core ---
+  trailGfx.clear();
   for (const p of probes) {
     const pts = p.trail;
     if (pts.length < 2) continue;
-    ctx.shadowColor = `hsl(${p.hue}, 100%, 65%)`;
-    ctx.lineWidth = 1.6 / z;            // thin, ~constant width on screen
+    const glowC = hsl2hex(p.hue, 100, 60);
+    const coreC = hsl2hex(p.hue, 100, 85);
     for (let i = 1; i < pts.length; i++) {
-      const t = i / (pts.length - 1);   // 0 at tail -> 1 at head
-      const A = pts[i - 1];
-      const B = pts[i];
-      ctx.strokeStyle = `hsla(${p.hue}, 100%, 82%, ${t})`;
-      ctx.shadowBlur = 6 * t;           // subtle neon halo, brighter toward head
-      ctx.beginPath();
-      ctx.moveTo(A.x, A.y);
-      ctx.lineTo(B.x, B.y);
-      ctx.stroke();
+      const t = i / (pts.length - 1);       // 0 tail -> 1 head
+      const A = pts[i - 1], B = pts[i];
+      trailGfx.moveTo(A.x, A.y).lineTo(B.x, B.y)
+        .stroke({ width: (3.4 * uiScale) / z, color: glowC, alpha: 0.12 * t, cap: 'round' });
+      trailGfx.moveTo(A.x, A.y).lineTo(B.x, B.y)
+        .stroke({ width: (1.5 * uiScale) / z, color: coreC, alpha: 0.9 * t, cap: 'round' });
     }
   }
-  ctx.shadowBlur = 0;
-  ctx.shadowColor = 'transparent';
-  ctx.globalCompositeOperation = 'source-over';
 
-  // Stars (users).
-  for (const u of users) {
+  // --- Stars (users): additive glow sprite + star body + rings + label ---
+  ensureSprites(starGlowLayer, starGlowPool, users.length);
+  ensureLabels(starLabelLayer, starLabelPool, users.length, 0.5, 1);
+  starGfx.clear();
+  users.forEach((u, idx) => {
     const pulse = u.pulse;
     const vis = 0.2 + 0.8 * u.pullForce;
 
+    const gs = starGlowPool[idx];
+    gs.visible = true;
+    gs.position.set(u.x, u.y);
+    gs.width = gs.height = (u.r + 12) * 2;
+    gs.tint = 0xffd696;
+    gs.alpha = vis * (0.45 + pulse * 0.5);
+
     if (pulse > 0) {
-      ctx.strokeStyle = `rgba(255, 210, 130, ${pulse})`;
-      ctx.lineWidth = 2 / z;
-      ctx.beginPath();
-      ctx.arc(u.x, u.y, u.r + 6 + (1 - pulse) * 16, 0, Math.PI * 2);
-      ctx.stroke();
+      starGfx.circle(u.x, u.y, u.r + 6 + (1 - pulse) * 16)
+        .stroke({ width: 2 / z, color: 0xffd282, alpha: pulse });
     }
-
-    ctx.globalAlpha = vis;
-    const g = ctx.createRadialGradient(u.x, u.y, 0, u.x, u.y, u.r + 12);
-    g.addColorStop(0, `rgba(255, 214, 150, ${0.5 + pulse * 0.5})`);
-    g.addColorStop(1, 'rgba(255, 214, 150, 0)');
-    ctx.fillStyle = g;
-    ctx.beginPath();
-    ctx.arc(u.x, u.y, u.r + 12, 0, Math.PI * 2);
-    ctx.fill();
-    drawStar(u.x, u.y, u.r, pulse);
-    ctx.globalAlpha = 1;
-
+    drawStarShape(u.x, u.y, u.r, pulse, vis);
     if (u.id === selectedUserId) {
-      ctx.strokeStyle = 'rgba(159, 231, 255, 0.9)';
-      ctx.lineWidth = 1.5 / z;
-      ctx.setLineDash([4 / z, 4 / z]);
-      ctx.beginPath();
-      ctx.arc(u.x, u.y, u.r + 12, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.setLineDash([]);
+      starGfx.circle(u.x, u.y, u.r + 12)
+        .stroke({ width: 1.5 / z, color: 0x9fe7ff, alpha: 0.9 });
     }
 
-    // Label: proportional to the star's on-screen size, scaled for mobile, and
-    // hidden when the star is too small on screen (keeps a fit-view uncluttered).
+    const lbl = starLabelPool[idx];
     const screenR = u.r * z;
     if (screenR > 4 * uiScale || u.id === selectedUserId) {
       const labelPx = clamp(screenR * 0.85, 8, 14) * uiScale;
-      ctx.globalAlpha = 0.4 + 0.5 * u.pullForce;
-      ctx.fillStyle = u.loggedIn ? '#ffe9c2' : '#8aa0ad';
-      ctx.font = `${labelPx / z}px ui-monospace, monospace`;
-      ctx.textAlign = 'center';
       const tag = u.pullForce <= PULL_MIN ? ' · offline' : ` · ${u.hits}`;
-      ctx.fillText(`${u.name}${tag}`, u.x, u.y - u.r - (labelPx * 0.5 + 3) / z);
-      ctx.globalAlpha = 1;
+      lbl.visible = true;
+      setLabel(lbl, `${u.name}${tag}`, u.loggedIn ? 0xffe9c2 : 0x8aa0ad);
+      lbl.alpha = 0.4 + 0.5 * u.pullForce;
+      lbl.scale.set(labelPx / (16 * z));
+      lbl.position.set(u.x, u.y - u.r - 3 / z);
+    } else {
+      lbl.visible = false;
     }
-  }
+  });
 
-  // Probes — glowing neon orb: soft additive halo + colored core + hot centre.
+  // --- Probes: additive glow sprite + colored core + hot white centre ---
   const R = CONFIG.probeRadius;
-  ctx.globalCompositeOperation = 'lighter';
-  for (const p of probes) {
-    const glow = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, R * 3);
-    glow.addColorStop(0, `hsla(${p.hue}, 100%, 70%, 0.55)`);
-    glow.addColorStop(0.4, `hsla(${p.hue}, 100%, 62%, 0.28)`);
-    glow.addColorStop(1, `hsla(${p.hue}, 100%, 60%, 0)`);
-    ctx.fillStyle = glow;
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, R * 3, 0, Math.PI * 2);
-    ctx.fill();
-  }
-  ctx.globalCompositeOperation = 'source-over';
+  ensureSprites(probeGlowLayer, probeGlowPool, probes.length);
+  probeGfx.clear();
+  probes.forEach((p, idx) => {
+    const gs = probeGlowPool[idx];
+    gs.visible = true;
+    gs.position.set(p.x, p.y);
+    gs.width = gs.height = R * 6;              // glow radius ~ R*3
+    gs.tint = hsl2hex(p.hue, 100, 66);
+    gs.alpha = 0.6;
+    probeGfx.circle(p.x, p.y, R).fill(hsl2hex(p.hue, 100, 68));
+    probeGfx.circle(p.x, p.y, R * 0.45).fill(0xf4fbff);
+  });
 
-  for (const p of probes) {
-    ctx.fillStyle = `hsl(${p.hue}, 100%, 68%)`;
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, R, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = '#f4fbff';
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, R * 0.45, 0, Math.PI * 2);
-    ctx.fill();
-  }
-
+  // --- Seek target ring ---
+  seekGfx.clear();
   if (seekTarget) {
-    ctx.strokeStyle = 'rgba(159, 231, 255, 0.5)';
-    ctx.lineWidth = 1.5 / z;
-    ctx.beginPath();
-    ctx.arc(seekTarget.x, seekTarget.y, 10 / z, 0, Math.PI * 2);
-    ctx.stroke();
+    seekGfx.circle(seekTarget.x, seekTarget.y, 10 / z)
+      .stroke({ width: 1.5 / z, color: 0x9fe7ff, alpha: 0.5 });
   }
 
-  setScreenTransform();
+  app.render();
 }
 
-function drawStar(x, y, r, pulse) {
+// 4-point star body drawn into the shared starGfx (v8: build points -> poly -> fill).
+function drawStarShape(x, y, r, pulse, vis) {
   const spikes = 4;
   const outer = r + pulse * 3;
   const inner = outer * 0.4;
-  ctx.beginPath();
+  const pts = [];
   for (let i = 0; i < spikes * 2; i++) {
     const rad = i % 2 === 0 ? outer : inner;
     const a = (Math.PI / spikes) * i - Math.PI / 2;
-    const px = x + Math.cos(a) * rad;
-    const py = y + Math.sin(a) * rad;
-    i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+    pts.push(x + Math.cos(a) * rad, y + Math.sin(a) * rad);
   }
-  ctx.closePath();
-  ctx.fillStyle = 'rgba(255, 240, 210, 0.9)';
-  ctx.fill();
+  starGfx.poly(pts, true).fill({ color: 0xfff0d2, alpha: 0.9 * vis });
 }
 
 // ---------------------------------------------------------------------------
@@ -978,4 +1065,4 @@ function frame(now) {
 
   requestAnimationFrame(frame);
 }
-requestAnimationFrame(frame);
+// The render loop is started by bootstrap() once app.init() resolves (v8 is async).
