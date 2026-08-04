@@ -56,8 +56,8 @@ STAR_MIN_GAP = 12.0
 PULL_FADE = 3.0
 PROBE_RADIUS = 6.0
 SPAWN_INTERVAL = 10.0
-PROBE_RATIO = 0.10   # max probes = 10% of active (logged-in) users...
-MIN_PROBES = 1       # ...but never fewer than this (keeps the map alive)
+PROBE_RATIO = 0.10   # max probes = the BIGGER of 10% of active users...
+MIN_PROBES = 10      # ...or this floor (so there are always at least 10)
 SECTOR_SIZE = 560.0
 SECTOR_COLS = 4
 SECTOR_PAD = 70.0
@@ -227,7 +227,7 @@ class Sim:
         return sum(1 for u in self.users if u["loggedIn"])
 
     def max_probes(self):
-        # Cap scales with engagement: 10% of active users, at least MIN_PROBES.
+        # Cap = the bigger of 10% of active users or MIN_PROBES.
         return max(MIN_PROBES, int(self.active_users() * PROBE_RATIO))
 
     def spawn_probe(self):
