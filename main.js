@@ -1,87 +1,64 @@
 /*
- * Space Map POC
- * Autonomous "probes" (roaming dots) drift across a starfield and collide with
- * "users" — star-nodes placed on the map. Stars are grouped into named SECTORS
- * (every 10 stars = one sector). The map has world-space coordinates with a
- * pan/zoom camera, plus a search bar to jump to a star or sector.
+ * Space Map — LIVE (server-authoritative client)
  *
- * Engine pieces (portable to React Native / Flutter / Unity later):
- *   1. World + camera        (world coords, screen<->world transforms)
- *   2. Entities / state      (users, probes, sectors, background stars)
- *   3. update(dt)            (steering / collisions / camera easing — the tick)
- *   4. render()              (draw current state through the camera)
- *   5. the loop              (update + render every frame, delta-timed)
+ * This client does NOT simulate anything. The server owns the world (probes,
+ * collisions, growth) and streams JSON snapshots over SSE (/api/stream). Here we
+ * only:
+ *   1. connect to the stream and mirror the latest snapshot into local state,
+ *   2. smoothly interpolate probe/camera motion between snapshots, and draw,
+ *   3. send user input (join / login / reset) back to the server via HTTP.
+ * Because every client renders the same authoritative snapshots, all tabs and
+ * browsers now see the SAME probes, growth and board.
  */
 
 // ---------------------------------------------------------------------------
-// Config
+// Config (client-side: rendering + layout only; physics live on the server)
 // ---------------------------------------------------------------------------
 const CONFIG = {
-  maxSpeed: 90,
-  wanderStrength: 2.6,
-  edgeMargin: 120,
-  edgeForce: 140,
-  seekForce: 220,
-
-  userRadius: 10,
-  userAttraction: 26,    // BASE pull; each star scales this by its pullForce
-  userGrowth: 2.5,
-  maxUserRadius: 46,
-  starMinGap: 12,        // min empty space (world px) to keep between star edges
-  pullFade: 3,           // how fast pullForce eases to its login target
-
+  userRadius: 10,        // must match the server's USER_RADIUS (for growth math)
   probeRadius: 6,
-  spawnInterval: 10,
-  maxProbes: 10,
+  maxProbes: 10,         // HUD display only
 
-  // Sectors
-  sectorSize: 560,       // world px per sector cell (square)
-  sectorCols: 4,         // sectors are laid out in a grid this many columns wide
-  sectorPad: 70,         // keep stars this far inside their sector cell
-  starsPerSector: 10,    // every N stars form a new sector
+  sectorSize: 560,       // must match server SECTOR_SIZE
+  sectorCols: 4,
+  sectorPad: 70,
+  starsPerSector: 10,
 
-  // Camera
   zoomMax: 2.6,
   zoomStep: 1.25,
 
   starCounts: [140, 90, 50],
-  trailLength: 26,       // number of recent points kept per probe for its neon trail
+  trailLength: 26,       // client-built neon trail length
+  probeEase: 14,         // how fast displayed probe pos chases the server target
 };
 
-const PULL_MIN = 0.05; // below this a star is inert (no pull, no collisions)
-
+const PULL_MIN = 0.05;
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
 // ---------------------------------------------------------------------------
-// Renderer — PixiJS v8 (WebGL/WebGPU). We keep our own update()/loop and drive
-// drawing manually (autoStart:false); ONLY the draw layer is Pixi. All
-// simulation, camera math, persistence and HTML UI stay exactly as before.
-// v8 note: app.init() is async, so the renderer-owned objects are created in
-// bootstrap() below and the render loop only starts once init resolves.
+// Renderer — PixiJS v8 (WebGL/WebGPU). Same setup as the POC; only the source
+// of truth changed (server snapshots instead of a local sim).
 // ---------------------------------------------------------------------------
 const canvas = document.getElementById('map');
 
 const world = { w: window.innerWidth, h: window.innerHeight };  // CSS pixels
 let dpr = Math.min(window.devicePixelRatio || 1, 2);
-let uiScale = 1;                 // shrinks on-screen text/lines on small screens
+let uiScale = 1;
 
-const app = new PIXI.Application();   // v8: construct empty, configure via init()
+const app = new PIXI.Application();
 let rendererReady = false;
 
-// Renderer-owned display objects (assigned in bootstrap() after app.init()).
 let glowTex;
 let bgLayer, worldLayer;
 let sectorGfx, sectorLabelLayer, trailGfx, starGlowLayer, starGfx,
-  starLabelLayer, probeGlowLayer, probeGfx, seekGfx;
+  starLabelLayer, probeGlowLayer, probeGfx;
 
-// --- Pools (reuse display objects; hide extras instead of destroying) ---
 const starGlowPool = [];
 const probeGlowPool = [];
 const sectorLabelPool = [];
 const starLabelPool = [];
 let bgStars = [];
 
-// Soft radial texture reused for every glow (stars, probes, background dots).
 function makeGlowTexture() {
   const size = 128;
   const c = document.createElement('canvas');
@@ -99,7 +76,7 @@ function makeGlowTexture() {
 function makeGlowSprite() {
   const s = new PIXI.Sprite(glowTex);
   s.anchor.set(0.5);
-  s.blendMode = 'add';           // v8: blend modes are strings
+  s.blendMode = 'add';
   return s;
 }
 function ensureSprites(layer, pool, n) {
@@ -108,7 +85,6 @@ function ensureSprites(layer, pool, n) {
 }
 function ensureLabels(layer, pool, n, anchorX, anchorY) {
   while (pool.length < n) {
-    // v8: options-object constructor. White fill so we can recolour via tint.
     const t = new PIXI.Text({
       text: '',
       style: { fontFamily: 'ui-monospace, monospace', fontSize: 16, fill: 0xffffff },
@@ -120,14 +96,11 @@ function ensureLabels(layer, pool, n, anchorX, anchorY) {
   }
   for (let i = n; i < pool.length; i++) pool[i].visible = false;
 }
-// Update a pooled label's text/colour ONLY when it changes — v8 Text re-rasterises
-// on every .text / .style change, so we guard to keep per-frame cost near zero.
 function setLabel(t, text, fill) {
   if (t._txt !== text) { t.text = text; t._txt = text; }
   if (t._fill !== fill) { t.style.fill = fill; t._fill = fill; }
 }
 
-// HSL (matches the old hsl() trail/probe colours) -> 0xRRGGBB for Pixi tint.
 function hsl2hex(h, s, l) {
   s /= 100; l /= 100;
   const k = (n) => (n + h / 30) % 12;
@@ -137,123 +110,6 @@ function hsl2hex(h, s, l) {
   return (to(f(0)) << 16) | (to(f(8)) << 8) | to(f(4));
 }
 
-// Background starfield as soft additive sprites (rebuilt on resize).
-function buildBackground() {
-  for (const c of bgLayer.removeChildren()) c.destroy();
-  bgStars = [];
-  for (const layer of makeStars()) {
-    for (const s of layer.stars) {
-      const sp = new PIXI.Sprite(glowTex);
-      sp.anchor.set(0.5);
-      sp.blendMode = 'add';
-      sp.tint = 0xcfe9ff;
-      sp.width = sp.height = Math.max(1.2, s.r) * 3.2;
-      bgStars.push({ sprite: sp, baseX: s.x, baseY: s.y, a: s.a, tw: s.tw, depth: layer.depth });
-      bgLayer.addChild(sp);
-    }
-  }
-}
-
-// Camera = worldLayer transform (replaces the old ctx setWorldTransform()).
-function applyCamera() {
-  worldLayer.scale.set(cam.zoom);
-  worldLayer.position.set(world.w / 2 - cam.x * cam.zoom, world.h / 2 - cam.y * cam.zoom);
-}
-
-function resize() {
-  dpr = Math.min(window.devicePixelRatio || 1, 2);
-  world.w = window.innerWidth;
-  world.h = window.innerHeight;
-  // Phones (small min-side) get proportionally smaller labels/strokes so the
-  // map isn't dominated by text; desktop stays at full size.
-  uiScale = clamp(Math.min(world.w, world.h) / 820, 0.62, 1);
-  if (!rendererReady) return;    // renderer not built yet (pre-init)
-  app.renderer.resize(world.w, world.h);
-  buildBackground();
-}
-window.addEventListener('resize', resize);
-
-// v8 async init: build renderer + scene graph, then start the render loop.
-async function bootstrap() {
-  await app.init({
-    canvas,
-    width: world.w,
-    height: world.h,
-    background: 0x05070d,
-    antialias: true,
-    resolution: dpr,
-    autoDensity: true,
-    autoStart: false,            // we render from our own rAF loop
-  });
-
-  glowTex = makeGlowTexture();
-
-  bgLayer = new PIXI.Container();
-  worldLayer = new PIXI.Container();
-  app.stage.addChild(bgLayer, worldLayer);
-
-  sectorGfx = new PIXI.Graphics();
-  sectorLabelLayer = new PIXI.Container();
-  trailGfx = new PIXI.Graphics(); trailGfx.blendMode = 'add';
-  starGlowLayer = new PIXI.Container();
-  starGfx = new PIXI.Graphics();
-  starLabelLayer = new PIXI.Container();
-  probeGlowLayer = new PIXI.Container();
-  probeGfx = new PIXI.Graphics();
-  seekGfx = new PIXI.Graphics();
-  worldLayer.addChild(
-    sectorGfx, sectorLabelLayer, trailGfx,
-    starGlowLayer, starGfx, starLabelLayer,
-    probeGlowLayer, probeGfx, seekGfx,
-  );
-
-  rendererReady = true;
-  resize();                      // size renderer + build background
-  last = performance.now();
-  requestAnimationFrame(frame);
-}
-bootstrap();
-
-// ---------------------------------------------------------------------------
-// Sectors — every `starsPerSector` stars form a sector with a unique name,
-// laid out in a fixed grid so existing sectors never move as new ones appear.
-// ---------------------------------------------------------------------------
-const SECTOR_WORDS = [
-  'Andromeda', 'Cygnus', 'Draco', 'Eridanus', 'Fornax', 'Hydra', 'Indus', 'Lyra',
-  'Orion', 'Perseus', 'Phoenix', 'Serpens', 'Tucana', 'Vela', 'Carina', 'Pyxis',
-];
-
-function sectorCount() {
-  return Math.max(1, Math.ceil(users.length / CONFIG.starsPerSector));
-}
-function sectorIndexForUser(i) {
-  return Math.floor(i / CONFIG.starsPerSector);
-}
-function sectorName(i) {
-  const base = SECTOR_WORDS[i % SECTOR_WORDS.length];
-  const tier = Math.floor(i / SECTOR_WORDS.length);
-  return tier > 0 ? `${base}-${tier + 1}` : base;
-}
-function sectorOrigin(i) {
-  const col = i % CONFIG.sectorCols;
-  const row = Math.floor(i / CONFIG.sectorCols);
-  return { x: col * CONFIG.sectorSize, y: row * CONFIG.sectorSize };
-}
-function sectorCenter(i) {
-  const o = sectorOrigin(i);
-  return { x: o.x + CONFIG.sectorSize / 2, y: o.y + CONFIG.sectorSize / 2 };
-}
-// Bounding size of the whole occupied world (used for probe roaming + fit zoom).
-function worldSize() {
-  const n = sectorCount();
-  const cols = Math.min(n, CONFIG.sectorCols);
-  const rows = Math.ceil(n / CONFIG.sectorCols);
-  return { w: cols * CONFIG.sectorSize, h: rows * CONFIG.sectorSize };
-}
-
-// ---------------------------------------------------------------------------
-// Background stars — decorative, drawn in screen space with parallax.
-// ---------------------------------------------------------------------------
 function makeStars() {
   return CONFIG.starCounts.map((count, i) => {
     const depth = (i + 1) / CONFIG.starCounts.length;
@@ -270,189 +126,208 @@ function makeStars() {
     return { depth, stars };
   });
 }
-// Background sprites are built by buildBackground() in the renderer setup.
 
-// ---------------------------------------------------------------------------
-// Users — persisted "local users". Position stored as a fraction (fx, fy)
-// INSIDE the user's sector cell, so planets stay put as sectors are added.
-// ---------------------------------------------------------------------------
-const STORAGE_KEY = 'space-map-users-v2';
-try { localStorage.removeItem('space-map-users-v1'); } catch {} // clear old data
-let userSeq = 0;
-let users = loadUsers();
-
-function loadUsers() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return [];
-    return JSON.parse(raw).map((u) => {
-      const loggedIn = u.loggedIn ?? false;
-      return {
-        id: userSeq++,
-        name: u.name,
-        fx: u.fx,
-        fy: u.fy,
-        r: u.r ?? CONFIG.userRadius,
-        hits: u.hits ?? 0,
-        createdAt: u.createdAt ?? Date.now(),
-        loggedIn,
-        pullForce: loggedIn ? 1 : 0,
-        pulse: 0,
-        tw: Math.random() * Math.PI * 2,
-        x: 0, y: 0, sector: 0,
-      };
-    });
-  } catch {
-    return [];
+function buildBackground() {
+  for (const c of bgLayer.removeChildren()) c.destroy();
+  bgStars = [];
+  for (const layer of makeStars()) {
+    for (const s of layer.stars) {
+      const sp = new PIXI.Sprite(glowTex);
+      sp.anchor.set(0.5);
+      sp.blendMode = 'add';
+      sp.tint = 0xcfe9ff;
+      sp.width = sp.height = Math.max(1.2, s.r) * 3.2;
+      bgStars.push({ sprite: sp, baseX: s.x, baseY: s.y, a: s.a, tw: s.tw, depth: layer.depth });
+      bgLayer.addChild(sp);
+    }
   }
 }
 
-function saveUsers() {
-  const data = users.map((u) => ({
-    name: u.name, fx: u.fx, fy: u.fy, r: u.r, hits: u.hits, createdAt: u.createdAt, loggedIn: u.loggedIn,
+function applyCamera() {
+  worldLayer.scale.set(cam.zoom);
+  worldLayer.position.set(world.w / 2 - cam.x * cam.zoom, world.h / 2 - cam.y * cam.zoom);
+}
+
+function resize() {
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  world.w = window.innerWidth;
+  world.h = window.innerHeight;
+  uiScale = clamp(Math.min(world.w, world.h) / 820, 0.62, 1);
+  if (!rendererReady) return;
+  app.renderer.resize(world.w, world.h);
+  buildBackground();
+}
+window.addEventListener('resize', resize);
+
+async function bootstrap() {
+  await app.init({
+    canvas,
+    width: world.w,
+    height: world.h,
+    background: 0x05070d,
+    antialias: true,
+    resolution: dpr,
+    autoDensity: true,
+    autoStart: false,
+  });
+
+  glowTex = makeGlowTexture();
+
+  bgLayer = new PIXI.Container();
+  worldLayer = new PIXI.Container();
+  app.stage.addChild(bgLayer, worldLayer);
+
+  sectorGfx = new PIXI.Graphics();
+  sectorLabelLayer = new PIXI.Container();
+  trailGfx = new PIXI.Graphics(); trailGfx.blendMode = 'add';
+  starGlowLayer = new PIXI.Container();
+  starGfx = new PIXI.Graphics();
+  starLabelLayer = new PIXI.Container();
+  probeGlowLayer = new PIXI.Container();
+  probeGfx = new PIXI.Graphics();
+  worldLayer.addChild(
+    sectorGfx, sectorLabelLayer, trailGfx,
+    starGlowLayer, starGfx, starLabelLayer,
+    probeGlowLayer, probeGfx,
+  );
+
+  rendererReady = true;
+  resize();
+  last = performance.now();
+  requestAnimationFrame(frame);
+}
+bootstrap();
+
+// ---------------------------------------------------------------------------
+// Sectors — deterministic from the number of users (same math as the server).
+// ---------------------------------------------------------------------------
+const SECTOR_WORDS = [
+  'Andromeda', 'Cygnus', 'Draco', 'Eridanus', 'Fornax', 'Hydra', 'Indus', 'Lyra',
+  'Orion', 'Perseus', 'Phoenix', 'Serpens', 'Tucana', 'Vela', 'Carina', 'Pyxis',
+];
+function sectorCount() { return Math.max(1, Math.ceil(users.length / CONFIG.starsPerSector)); }
+function sectorName(i) {
+  const base = SECTOR_WORDS[i % SECTOR_WORDS.length];
+  const tier = Math.floor(i / SECTOR_WORDS.length);
+  return tier > 0 ? `${base}-${tier + 1}` : base;
+}
+function sectorOrigin(i) {
+  const col = i % CONFIG.sectorCols;
+  const row = Math.floor(i / CONFIG.sectorCols);
+  return { x: col * CONFIG.sectorSize, y: row * CONFIG.sectorSize };
+}
+function sectorCenter(i) {
+  const o = sectorOrigin(i);
+  return { x: o.x + CONFIG.sectorSize / 2, y: o.y + CONFIG.sectorSize / 2 };
+}
+function worldSize() {
+  const n = sectorCount();
+  const cols = Math.min(n, CONFIG.sectorCols);
+  const rows = Math.ceil(n / CONFIG.sectorCols);
+  return { w: cols * CONFIG.sectorSize, h: rows * CONFIG.sectorSize };
+}
+
+// ---------------------------------------------------------------------------
+// State — mirrors the latest server snapshot. No simulation here.
+// ---------------------------------------------------------------------------
+let users = [];                 // [{id,name,x,y,r,hits,loggedIn,pullForce,pulse,createdAt,sector}]
+let probes = [];                // display probes: {id,x,y,tx,ty,hue,trail:[]}
+const probeById = new Map();
+let collisionCount = 0;
+let maxProbes = CONFIG.maxProbes;   // live cap from the server (10% of active users)
+let serverRev = -1;
+let selectedUserId = null;
+let firstSnapshot = false;
+let linkUp = false;
+
+function getUserById(id) { return users.find((u) => u.id === id) || null; }
+
+// Merge a server snapshot into local state.
+function applySnapshot(snap) {
+  collisionCount = snap.collisions || 0;
+  if (typeof snap.maxProbes === 'number') maxProbes = snap.maxProbes;
+
+  // Users: rebuild the mirror (cheap — a handful of entries).
+  users = (snap.users || []).map((s) => ({
+    id: s.id, name: s.name, x: s.x, y: s.y, r: s.r, hits: s.hits,
+    loggedIn: s.loggedIn, pullForce: s.pull, pulse: s.pulse,
+    createdAt: s.createdAt, sector: s.sector,
   }));
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); } catch {}
-}
 
-// Cross-tab roster sync: when another tab changes the stored roster, merge the
-// changes here WITHOUT resetting this tab's live simulation (r/hits/pulse are
-// kept for users that still exist). The stored order is the source of truth, so
-// rebuilding in that order keeps sector assignment identical across tabs.
-window.addEventListener('storage', (e) => {
-  if (e.key === STORAGE_KEY) applyRoster(e.newValue);
-});
-
-function applyRoster(raw) {
-  let data;
-  try { data = raw ? JSON.parse(raw) : []; } catch { return; }
-
-  const byName = new Map(users.map((u) => [u.name.toLowerCase(), u]));
-  users = data.map((d) => {
-    const existing = byName.get((d.name || '').toLowerCase());
-    if (existing) {
-      // Keep live sim state; only refresh roster fields.
-      existing.fx = d.fx;
-      existing.fy = d.fy;
-      existing.loggedIn = d.loggedIn ?? false;
-      existing.createdAt = d.createdAt ?? existing.createdAt;
-      return existing;
+  // Probes: keep display objects across snapshots so we can interpolate + trail.
+  const seen = new Set();
+  for (const s of (snap.probes || [])) {
+    let p = probeById.get(s.id);
+    if (!p) {
+      p = { id: s.id, x: s.x, y: s.y, tx: s.x, ty: s.y, hue: s.hue, trail: [] };
+      probeById.set(s.id, p);
+      probes.push(p);
+    } else {
+      p.tx = s.x; p.ty = s.y; p.hue = s.hue;
     }
-    const loggedIn = d.loggedIn ?? false;
-    return {
-      id: userSeq++,
-      name: d.name,
-      fx: d.fx,
-      fy: d.fy,
-      r: d.r ?? CONFIG.userRadius,
-      hits: d.hits ?? 0,
-      createdAt: d.createdAt ?? Date.now(),
-      loggedIn,
-      pullForce: loggedIn ? 1 : 0,
-      pulse: 0,
-      tw: Math.random() * Math.PI * 2,
-      x: 0, y: 0, sector: 0,
-    };
-  });
-
-  positionUsers();
-  if (selectedUserId !== null && !users.some((u) => u.id === selectedUserId)) {
-    selectedUserId = null;
-    hideStarInfo();
+    seen.add(s.id);
   }
-  refreshLoginUI();
-}
+  for (let i = probes.length - 1; i >= 0; i--) {
+    if (!seen.has(probes[i].id)) { probeById.delete(probes[i].id); probes.splice(i, 1); }
+  }
 
-// Place each user inside its sector cell (fraction -> world pixels).
-function positionUsers() {
-  const S = CONFIG.sectorSize;
-  const pad = CONFIG.sectorPad;
-  users.forEach((u, i) => {
-    u.sector = sectorIndexForUser(i);
-    const o = sectorOrigin(u.sector);
-    u.x = o.x + pad + u.fx * (S - pad * 2);
-    u.y = o.y + pad + u.fy * (S - pad * 2);
-  });
-}
-
-// Find a spot inside a sector that keeps a minimum gap from existing stars.
-// Tries several random candidates; if none clear the bar, returns the best
-// (the one furthest from its nearest neighbour). Fraction is relative to the cell.
-function placeStarFraction(sectorIndex) {
-  const S = CONFIG.sectorSize;
-  const pad = CONFIG.sectorPad;
-  const o = sectorOrigin(sectorIndex);
-  const wantCenterDist = 2 * CONFIG.userRadius + CONFIG.starMinGap;
-  const others = users.filter((u) => u.sector === sectorIndex);
-
-  let best = { fx: Math.random(), fy: Math.random() };
-  let bestNearest = -1;
-  for (let attempt = 0; attempt < 40; attempt++) {
-    const fx = Math.random();
-    const fy = Math.random();
-    const x = o.x + pad + fx * (S - pad * 2);
-    const y = o.y + pad + fy * (S - pad * 2);
-    let nearest = Infinity;
-    for (const u of others) {
-      const d = Math.hypot(u.x - x, u.y - y);
-      if (d < nearest) nearest = d;
+  // Roster membership / login changed → refresh dependent UI.
+  if (snap.rev !== serverRev) {
+    serverRev = snap.rev;
+    refreshLoginUI();
+    if (selectedUserId !== null && !getUserById(selectedUserId)) {
+      selectedUserId = null;
+      hideStarInfo();
     }
-    if (nearest >= wantCenterDist) return { fx, fy };
-    if (nearest > bestNearest) { bestNearest = nearest; best = { fx, fy }; }
+    if (fitPending) { fitPending = false; fitView(); }
   }
-  return best;
+
+  if (!firstSnapshot) { firstSnapshot = true; fitView(); }
 }
 
-// The largest radius a star may grow to without overlapping any neighbour
-// (accounting for the neighbour's current radius plus the required gap).
-function allowedRadius(u) {
-  let cap = CONFIG.maxUserRadius;
-  for (const o of users) {
-    if (o === u) continue;
-    const d = Math.hypot(o.x - u.x, o.y - u.y);
-    cap = Math.min(cap, d - o.r - CONFIG.starMinGap);
-  }
-  return cap;
-}
-
-function addUser(name) {
-  const sector = Math.floor(users.length / CONFIG.starsPerSector);
-  const spot = placeStarFraction(sector);
-  const u = {
-    id: userSeq++,
-    name: name.trim().slice(0, 16) || `User${users.length + 1}`,
-    fx: spot.fx,
-    fy: spot.fy,
-    r: CONFIG.userRadius,
-    hits: 0,
-    createdAt: Date.now(),
-    loggedIn: true,
-    pullForce: 0,
-    pulse: 0,
-    tw: Math.random() * Math.PI * 2,
-    x: 0, y: 0, sector: 0,
+// ---------------------------------------------------------------------------
+// SSE — the live link to the authoritative world.
+// ---------------------------------------------------------------------------
+let es = null;
+function connectStream() {
+  es = new EventSource('/api/stream');
+  es.onopen = () => { linkUp = true; };
+  es.onmessage = (e) => {
+    linkUp = true;
+    try { applySnapshot(JSON.parse(e.data)); } catch { /* ignore malformed */ }
   };
-  users.push(u);
-  positionUsers();
-  saveUsers();
-  return u;
+  es.onerror = () => { linkUp = false; };  // EventSource auto-reconnects
 }
+connectStream();
 
-function loginUser(name) {
-  const key = name.trim().toLowerCase();
-  const existing = key && users.find((u) => u.name.toLowerCase() === key);
-  if (existing) { existing.loggedIn = true; saveUsers(); return existing; }
-  return addUser(name);
+// ---------------------------------------------------------------------------
+// Server actions (client input -> authoritative server)
+// ---------------------------------------------------------------------------
+async function apiJoin(name) {
+  const res = await fetch('/api/join', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
+  });
+  return res.json();
 }
-
-function setLoggedIn(u, value) { u.loggedIn = value; saveUsers(); }
-
-positionUsers();
+async function apiLogin(id, value) {
+  try {
+    await fetch('/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, value }),
+    });
+  } catch { /* will resync on next snapshot */ }
+}
+async function apiReset() {
+  try { await fetch('/api/reset', { method: 'POST' }); } catch { /* ignore */ }
+}
 
 // ---------------------------------------------------------------------------
 // Camera — world-space view with smooth easing toward a target.
 // ---------------------------------------------------------------------------
 const cam = { x: 0, y: 0, zoom: 1 };
 const camTarget = { x: 0, y: 0, zoom: 1 };
+let fitPending = false;
 
 function fitZoom() {
   const b = worldSize();
@@ -474,37 +349,7 @@ function toWorld(sx, sy) {
 }
 
 // ---------------------------------------------------------------------------
-// Probes — roaming dots. Spawn within the occupied world bounds.
-// ---------------------------------------------------------------------------
-let probeSeq = 0;
-const probes = [];
-
-function spawnProbe() {
-  if (probes.length >= CONFIG.maxProbes) return;
-  const b = worldSize();
-  const m = CONFIG.edgeMargin;
-  const angle = Math.random() * Math.PI * 2;
-  probes.push({
-    id: probeSeq++,
-    x: m + Math.random() * Math.max(1, b.w - m * 2),
-    y: m + Math.random() * Math.max(1, b.h - m * 2),
-    vx: Math.cos(angle) * CONFIG.maxSpeed * 0.6,
-    vy: Math.sin(angle) * CONFIG.maxSpeed * 0.6,
-    wanderAngle: angle,
-    hue: 180 + Math.random() * 80,
-    trail: [],   // recent world positions for the neon trail
-  });
-}
-
-let spawnTimer = CONFIG.spawnInterval;
-let collisionCount = 0;
-spawnProbe(); // the map is always alive
-
-let seekTarget = null;       // world-space tap target
-let selectedUserId = null;
-
-// ---------------------------------------------------------------------------
-// Pointer: drag to pan, wheel to zoom, click to select a star / set a seek.
+// Pointer: drag to pan, wheel to zoom, click to select a star.
 // ---------------------------------------------------------------------------
 const pointer = { down: false, dragging: false, sx: 0, sy: 0, camX: 0, camY: 0 };
 
@@ -546,7 +391,6 @@ window.addEventListener('pointerup', (e) => {
   } else {
     selectedUserId = null;
     hideStarInfo();
-    seekTarget = { x: w.x, y: w.y, life: 2.5 };
   }
 });
 
@@ -563,7 +407,6 @@ canvas.addEventListener('wheel', (e) => {
   cam.y = camTarget.y = before.y - (my - world.h / 2) / nz;
 }, { passive: false });
 
-// Star under a world point (generous tap radius, constant in screen px).
 function userAt(x, y) {
   let hit = null;
   let bestD = Infinity;
@@ -574,13 +417,11 @@ function userAt(x, y) {
   }
   return hit;
 }
-function getUserById(id) { return users.find((u) => u.id === id) || null; }
 
 // ---------------------------------------------------------------------------
-// update(dt) — the tick
+// frame — ease camera + probes toward server targets, build trails, draw.
 // ---------------------------------------------------------------------------
-function update(dt) {
-  // Ease camera toward its target.
+function stepDisplay(dt) {
   const zmin = minZoom();
   camTarget.zoom = clamp(camTarget.zoom, zmin, CONFIG.zoomMax);
   const k = Math.min(1, dt * 8);
@@ -588,105 +429,19 @@ function update(dt) {
   cam.y += (camTarget.y - cam.y) * k;
   cam.zoom += (camTarget.zoom - cam.zoom) * k;
 
-  // Spawn probes over time.
-  spawnTimer -= dt;
-  if (spawnTimer <= 0) { spawnProbe(); spawnTimer += CONFIG.spawnInterval; }
-
-  if (seekTarget) {
-    seekTarget.life -= dt;
-    if (seekTarget.life <= 0) seekTarget = null;
-  }
-
-  // Ease pullForce toward login target; fade pulses.
-  const ease = Math.min(1, dt * CONFIG.pullFade);
-  for (const u of users) {
-    const target = u.loggedIn ? 1 : 0;
-    u.pullForce += (target - u.pullForce) * ease;
-    if (u.pulse > 0) u.pulse = Math.max(0, u.pulse - dt * 2.2);
-  }
-
-  const b = worldSize();
+  // Interpolate displayed probe positions toward the latest server target, then
+  // append to the client-built neon trail (smooth even at ~30Hz snapshots).
+  const pk = Math.min(1, dt * CONFIG.probeEase);
   for (const p of probes) {
-    let ax = 0, ay = 0;
-
-    p.wanderAngle += (Math.random() - 0.5) * CONFIG.wanderStrength * dt * 2;
-    ax += Math.cos(p.wanderAngle) * CONFIG.maxSpeed;
-    ay += Math.sin(p.wanderAngle) * CONFIG.maxSpeed;
-
-    if (p.x < CONFIG.edgeMargin) ax += CONFIG.edgeForce * (1 - p.x / CONFIG.edgeMargin);
-    if (p.x > b.w - CONFIG.edgeMargin) ax -= CONFIG.edgeForce * (1 - (b.w - p.x) / CONFIG.edgeMargin);
-    if (p.y < CONFIG.edgeMargin) ay += CONFIG.edgeForce * (1 - p.y / CONFIG.edgeMargin);
-    if (p.y > b.h - CONFIG.edgeMargin) ay -= CONFIG.edgeForce * (1 - (b.h - p.y) / CONFIG.edgeMargin);
-
-    if (CONFIG.userAttraction > 0) {
-      const near = nearestActiveUser(p.x, p.y);
-      if (near) {
-        const dx = near.x - p.x, dy = near.y - p.y;
-        const d = Math.hypot(dx, dy) || 1;
-        const force = CONFIG.userAttraction * near.pullForce;
-        ax += (dx / d) * force;
-        ay += (dy / d) * force;
-      }
-    }
-
-    if (seekTarget) {
-      const dx = seekTarget.x - p.x, dy = seekTarget.y - p.y;
-      const d = Math.hypot(dx, dy) || 1;
-      ax += (dx / d) * CONFIG.seekForce;
-      ay += (dy / d) * CONFIG.seekForce;
-    }
-
-    p.vx += ax * dt;
-    p.vy += ay * dt;
-    const speed = Math.hypot(p.vx, p.vy);
-    if (speed > CONFIG.maxSpeed) {
-      p.vx = (p.vx / speed) * CONFIG.maxSpeed;
-      p.vy = (p.vy / speed) * CONFIG.maxSpeed;
-    }
-    p.x += p.vx * dt;
-    p.y += p.vy * dt;
-
+    p.x += (p.tx - p.x) * pk;
+    p.y += (p.ty - p.y) * pk;
     p.trail.push({ x: p.x, y: p.y });
     if (p.trail.length > CONFIG.trailLength) p.trail.shift();
-  }
-
-  detectCollisions();
-}
-
-function nearestActiveUser(x, y) {
-  let best = null, bestD = Infinity;
-  for (const u of users) {
-    if (u.pullForce <= PULL_MIN) continue;
-    const d = (u.x - x) ** 2 + (u.y - y) ** 2;
-    if (d < bestD) { bestD = d; best = u; }
-  }
-  return best;
-}
-
-function detectCollisions() {
-  for (let i = probes.length - 1; i >= 0; i--) {
-    const p = probes[i];
-    for (const u of users) {
-      if (u.pullForce <= PULL_MIN) continue; // logged-out star: inert
-      const rr = CONFIG.probeRadius + u.r;
-      if ((p.x - u.x) ** 2 + (p.y - u.y) ** 2 <= rr * rr) {
-        u.hits++;
-        u.pulse = 1;
-        // Grow, but never past what would overlap a neighbour.
-        const newR = Math.min(u.r + CONFIG.userGrowth, allowedRadius(u));
-        if (newR > u.r) u.r = newR;
-        collisionCount++;
-        probes.splice(i, 1);
-        // NOTE: growth/hits are session-only (not persisted). Each tab runs its
-        // own sim; only the roster (below) is shared across tabs.
-        break;
-      }
-    }
   }
 }
 
 // ---------------------------------------------------------------------------
-// render() — sync the Pixi scene graph from current sim state, then draw.
+// render() — draw current state through the camera.
 // ---------------------------------------------------------------------------
 function render(time) {
   const z = cam.zoom;
@@ -713,13 +468,13 @@ function render(time) {
   ensureLabels(sectorLabelLayer, sectorLabelPool, n, 0, 0);
   for (let i = 0; i < n; i++) {
     const o = sectorOrigin(i);
-    sectorGfx.rect(o.x, o.y, S, S).stroke(sectorStroke);   // v8: shape-then-stroke
+    sectorGfx.rect(o.x, o.y, S, S).stroke(sectorStroke);
     const lbl = sectorLabelPool[i];
     if (showSectorLabel) {
       lbl.visible = true;
       setLabel(lbl, `SECTOR · ${sectorName(i).toUpperCase()}`, 0x96cdeb);
       lbl.alpha = 0.55;
-      lbl.scale.set(sectorFontPx / (16 * z));         // constant screen size
+      lbl.scale.set(sectorFontPx / (16 * z));
       lbl.position.set(o.x + (10 * uiScale) / z, o.y + (8 * uiScale) / z);
     } else {
       lbl.visible = false;
@@ -734,7 +489,7 @@ function render(time) {
     const glowC = hsl2hex(p.hue, 100, 60);
     const coreC = hsl2hex(p.hue, 100, 85);
     for (let i = 1; i < pts.length; i++) {
-      const t = i / (pts.length - 1);       // 0 tail -> 1 head
+      const t = i / (pts.length - 1);
       const A = pts[i - 1], B = pts[i];
       trailGfx.moveTo(A.x, A.y).lineTo(B.x, B.y)
         .stroke({ width: (3.4 * uiScale) / z, color: glowC, alpha: 0.12 * t, cap: 'round' });
@@ -791,24 +546,16 @@ function render(time) {
     const gs = probeGlowPool[idx];
     gs.visible = true;
     gs.position.set(p.x, p.y);
-    gs.width = gs.height = R * 6;              // glow radius ~ R*3
+    gs.width = gs.height = R * 6;
     gs.tint = hsl2hex(p.hue, 100, 66);
     gs.alpha = 0.6;
     probeGfx.circle(p.x, p.y, R).fill(hsl2hex(p.hue, 100, 68));
     probeGfx.circle(p.x, p.y, R * 0.45).fill(0xf4fbff);
   });
 
-  // --- Seek target ring ---
-  seekGfx.clear();
-  if (seekTarget) {
-    seekGfx.circle(seekTarget.x, seekTarget.y, 10 / z)
-      .stroke({ width: 1.5 / z, color: 0x9fe7ff, alpha: 0.5 });
-  }
-
   app.render();
 }
 
-// 4-point star body drawn into the shared starGfx (v8: build points -> poly -> fill).
 function drawStarShape(x, y, r, pulse, vis) {
   const spikes = 4;
   const outer = r + pulse * 3;
@@ -831,6 +578,7 @@ const hud = {
   sectors: document.getElementById('hud-sectors'),
   collisions: document.getElementById('hud-collisions'),
   fps: document.getElementById('hud-fps'),
+  link: document.getElementById('hud-link'),
 };
 let hudTimer = 0;
 function updateHud(dt, fps) {
@@ -838,11 +586,13 @@ function updateHud(dt, fps) {
   if (hudTimer > 0) return;
   hudTimer = 0.15;
   const online = users.reduce((a, u) => a + (u.loggedIn ? 1 : 0), 0);
-  hud.probes.textContent = `${probes.length} / ${CONFIG.maxProbes}`;
+  hud.probes.textContent = `${probes.length} / ${maxProbes}`;
   hud.users.textContent = `${online} / ${users.length} online`;
   hud.sectors.textContent = String(sectorCount());
   hud.collisions.textContent = String(collisionCount);
   hud.fps.textContent = fps.toFixed(0);
+  hud.link.textContent = linkUp ? 'live' : 'reconnecting…';
+  hud.link.className = linkUp ? 'link-live' : 'link-down';
   updateStarInfo();
 }
 
@@ -931,7 +681,7 @@ document.addEventListener('pointerdown', (e) => {
 });
 
 // ---------------------------------------------------------------------------
-// Login page
+// Login page — actions now go to the authoritative server.
 // ---------------------------------------------------------------------------
 const login = {
   panel: document.getElementById('login'),
@@ -942,52 +692,106 @@ const login = {
   reset: document.getElementById('reset-users'),
   close: document.getElementById('login-close'),
   addBtn: document.getElementById('add-user'),
+  error: document.getElementById('login-error'),
 };
 
 function showLogin() {
   login.panel.classList.remove('hidden');
+  clearLoginError();
   refreshLoginUI();
   setTimeout(() => login.nickname.focus(), 50);
 }
 function hideLogin() { login.panel.classList.add('hidden'); }
 
+function userExists(name) {
+  const key = name.trim().toLowerCase();
+  return !!key && users.some((u) => u.name.toLowerCase() === key);
+}
+function showLoginError(msg) {
+  login.error.textContent = msg;
+  login.error.classList.remove('hidden');
+}
+function clearLoginError() {
+  login.error.textContent = '';
+  login.error.classList.add('hidden');
+}
+
+const USER_LIST_LIMIT = 10;   // show the N most-recent users; rest behind a toggle
+let showAllUsers = false;
+
 function refreshLoginUI() {
   login.list.innerHTML = '';
-  for (const u of users) {
+
+  // Most-recently-joined first, so the "latest" users are always visible.
+  const ordered = [...users].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  const shown = showAllUsers ? ordered : ordered.slice(0, USER_LIST_LIMIT);
+
+  for (const u of shown) {
     const chip = document.createElement('span');
     chip.className = 'user-chip' + (u.loggedIn ? ' online' : '');
     chip.textContent = u.name;
     chip.title = u.loggedIn ? 'Logged in — click to log out' : 'Logged out — click to log in';
-    chip.addEventListener('click', () => { setLoggedIn(u, !u.loggedIn); refreshLoginUI(); updateStarInfo(); });
+    chip.addEventListener('click', () => { apiLogin(u.id, !u.loggedIn); });
     login.list.appendChild(chip);
   }
+
+  const hidden = users.length - shown.length;
+  if (users.length > USER_LIST_LIMIT) {
+    const more = document.createElement('span');
+    more.className = 'user-more';
+    more.textContent = showAllUsers ? 'show less' : `+${hidden} more`;
+    more.title = showAllUsers ? 'Collapse the list' : 'Show all users';
+    more.addEventListener('click', () => { showAllUsers = !showAllUsers; refreshLoginUI(); });
+    login.list.appendChild(more);
+  }
+
   login.enter.style.display = users.length ? 'inline-block' : 'none';
   login.close.style.display = 'flex';
   login.addBtn.style.display = 'flex';
 }
 
-function doJoin() {
-  loginUser(login.nickname.value);
-  login.nickname.value = '';
-  hideLogin();
-  refreshLoginUI();
-  fitView(); // open the map at the fit-all view
+async function doJoin() {
+  const name = login.nickname.value.trim();
+  if (!name) { showLoginError('Please enter a nickname.'); login.nickname.focus(); return; }
+  // Fast client-side check for snappy feedback; the server is the real authority.
+  if (userExists(name)) {
+    showLoginError(`"${name}" is already taken — please choose a different name.`);
+    login.nickname.select();
+    return;
+  }
+  login.join.disabled = true;
+  try {
+    const res = await apiJoin(name);
+    if (!res.ok) {
+      const msg = res.error === 'name_taken'
+        ? `"${name}" is already taken — please choose a different name.`
+        : 'Could not join — please try again.';
+      showLoginError(msg);
+      login.nickname.select();
+      return;
+    }
+    clearLoginError();
+    login.nickname.value = '';
+    fitPending = true;      // fit once the new user shows up in a snapshot
+    hideLogin();
+  } catch {
+    showLoginError('Server unreachable — please try again.');
+  } finally {
+    login.join.disabled = false;
+  }
 }
 
 login.join.addEventListener('click', doJoin);
 login.nickname.addEventListener('keydown', (e) => { if (e.key === 'Enter') doJoin(); });
-login.enter.addEventListener('click', () => { hideLogin(); refreshLoginUI(); fitView(); });
+login.nickname.addEventListener('input', clearLoginError);
+login.enter.addEventListener('click', () => { hideLogin(); fitView(); });
 login.close.addEventListener('click', hideLogin);
 login.addBtn.addEventListener('click', showLogin);
 login.reset.addEventListener('click', (e) => {
   e.preventDefault();
-  users.length = 0;
-  saveUsers();
-  positionUsers();
+  apiReset();
   selectedUserId = null;
   hideStarInfo();
-  fitView();
-  refreshLoginUI();
 });
 
 showLogin();
@@ -1014,9 +818,7 @@ starInfo.close.addEventListener('click', () => { selectedUserId = null; hideStar
 starInfo.toggle.addEventListener('click', () => {
   const u = getUserById(selectedUserId);
   if (!u) return;
-  setLoggedIn(u, !u.loggedIn);
-  refreshLoginUI();
-  updateStarInfo();
+  apiLogin(u.id, !u.loggedIn);   // server flips it; snapshot updates the panel
 });
 
 function showStarInfo() { starInfo.panel.classList.remove('hidden'); updateStarInfo(); }
@@ -1051,7 +853,7 @@ function updateStarInfo() {
 }
 
 // ---------------------------------------------------------------------------
-// The loop
+// The loop — pure rendering; the server drives the simulation.
 // ---------------------------------------------------------------------------
 let last = performance.now();
 function frame(now) {
@@ -1059,7 +861,7 @@ function frame(now) {
   last = now;
   dt = Math.min(dt, 0.05);
 
-  update(dt);
+  stepDisplay(dt);
   render(now);
   updateHud(dt, dt > 0 ? 1 / dt : 0);
 

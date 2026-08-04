@@ -3,30 +3,32 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-  <title>Space Map POC</title>
+  <title>Space Map · Live</title>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
   <div id="app">
     <canvas id="map"></canvas>
 
-    <!-- Login page: simulate local users joining; each login drops a planet -->
+    <!-- Login page: join a user; each join drops a planet (server-authoritative) -->
     <div id="login" class="hidden">
       <button id="login-close" title="Close">×</button>
       <div class="login-card">
         <div class="login-title">SPACE MAP</div>
-        <div class="login-sub">Log in a local user — their planet drops at a random spot on the map.</div>
+        <div class="login-sub">Join a user — their planet drops on the shared map that everyone sees live.</div>
 
         <label class="login-label" for="nickname">Nickname</label>
         <input id="nickname" type="text" maxlength="16" placeholder="e.g. Nova" autocomplete="off" />
 
         <div class="login-actions">
-          <button id="join-btn" class="btn-primary">Log in &amp; drop planet</button>
+          <button id="join-btn" class="btn-primary">Join &amp; drop planet</button>
           <button id="enter-btn" class="btn-ghost">Enter map</button>
         </div>
 
+        <div id="login-error" class="login-error hidden"></div>
+
         <div id="user-list" class="user-list"></div>
-        <a id="reset-users" href="#" class="reset-link">Reset local users</a>
+        <a id="reset-users" href="#" class="reset-link">Reset all users</a>
       </div>
     </div>
 
@@ -36,8 +38,8 @@
       <div id="search-results" class="hidden"></div>
     </div>
 
-    <!-- Floating button to add more local users while playing -->
-    <button id="add-user" title="Add local user">+ user</button>
+    <!-- Floating button to add more users while playing -->
+    <button id="add-user" title="Add user">+ user</button>
 
     <!-- Zoom controls -->
     <div id="zoom-controls">
@@ -64,14 +66,15 @@
       <button id="si-toggle" class="si-toggle">Log out</button>
     </div>
 
-    <!-- Heads-up display: live simulation stats -->
+    <!-- Heads-up display: live simulation stats (from the server) -->
     <div id="hud">
-      <div class="hud-title">SPACE MAP · POC</div>
+      <div class="hud-title">SPACE MAP · LIVE</div>
       <div class="hud-row"><span>probes</span><span id="hud-probes">–</span></div>
       <div class="hud-row"><span>users</span><span id="hud-users">–</span></div>
       <div class="hud-row"><span>sectors</span><span id="hud-sectors">–</span></div>
       <div class="hud-row"><span>collisions</span><span id="hud-collisions">–</span></div>
       <div class="hud-row"><span>fps</span><span id="hud-fps">–</span></div>
+      <div class="hud-row"><span>link</span><span id="hud-link">–</span></div>
     </div>
 
     <div id="hint">Drag to pan · scroll or use +/− to zoom · click a star for details · search to jump.</div>
