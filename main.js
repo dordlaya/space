@@ -235,6 +235,7 @@ let probes = [];                // display probes: {id,x,y,tx,ty,hue,trail:[]}
 const probeById = new Map();
 let collisionCount = 0;
 let maxProbes = CONFIG.maxProbes;   // live cap from the server (10% of active users)
+let spawnInterval = 10;             // live spawn cadence from the server (seconds)
 let serverRev = -1;
 let selectedUserId = null;
 let firstSnapshot = false;
@@ -246,13 +247,19 @@ function getUserById(id) { return users.find((u) => u.id === id) || null; }
 function applySnapshot(snap) {
   collisionCount = snap.collisions || 0;
   if (typeof snap.maxProbes === 'number') maxProbes = snap.maxProbes;
+  if (typeof snap.spawnInterval === 'number') spawnInterval = snap.spawnInterval;
 
-  // Users: rebuild the mirror (cheap — a handful of entries).
-  users = (snap.users || []).map((s) => ({
-    id: s.id, name: s.name, x: s.x, y: s.y, r: s.r, hits: s.hits,
-    loggedIn: s.loggedIn, pullForce: s.pull, pulse: s.pulse,
-    createdAt: s.createdAt, sector: s.sector,
-  }));
+  // Users only ride along on low-rate "user" ticks (or when the roster
+  // changes) — most snapshots are probes-only, so skip the rebuild then and
+  // keep the mirror we already have.
+  const hasUsers = Array.isArray(snap.users);
+  if (hasUsers) {
+    users = snap.users.map((s) => ({
+      id: s.id, name: s.name, x: s.x, y: s.y, r: s.r, hits: s.hits,
+      loggedIn: s.loggedIn, pullForce: s.pull, pulse: s.pulse,
+      createdAt: s.createdAt, sector: s.sector,
+    }));
+  }
 
   // Probes: keep display objects across snapshots so we can interpolate + trail.
   const seen = new Set();
@@ -271,8 +278,9 @@ function applySnapshot(snap) {
     if (!seen.has(probes[i].id)) { probeById.delete(probes[i].id); probes.splice(i, 1); }
   }
 
-  // Roster membership / login changed → refresh dependent UI.
-  if (snap.rev !== serverRev) {
+  // rev only travels with the users array. Roster membership / login changed →
+  // refresh dependent UI.
+  if (hasUsers && snap.rev !== serverRev) {
     serverRev = snap.rev;
     refreshLoginUI();
     if (selectedUserId !== null && !getUserById(selectedUserId)) {
@@ -282,21 +290,28 @@ function applySnapshot(snap) {
     if (fitPending) { fitPending = false; fitView(); }
   }
 
-  if (!firstSnapshot) { firstSnapshot = true; fitView(); }
+  if (!firstSnapshot && hasUsers) { firstSnapshot = true; fitView(); }
 }
 
 // ---------------------------------------------------------------------------
-// SSE — the live link to the authoritative world.
+// WebSocket — the live link to the authoritative world. Unlike EventSource,
+// WebSocket has no built-in reconnect, so we back off and retry ourselves.
 // ---------------------------------------------------------------------------
-let es = null;
+let ws = null;
+let reconnectDelay = 500;
 function connectStream() {
-  es = new EventSource('/api/stream');
-  es.onopen = () => { linkUp = true; };
-  es.onmessage = (e) => {
-    linkUp = true;
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.onopen = () => { linkUp = true; reconnectDelay = 500; };
+  ws.onmessage = (e) => {
     try { applySnapshot(JSON.parse(e.data)); } catch { /* ignore malformed */ }
   };
-  es.onerror = () => { linkUp = false; };  // EventSource auto-reconnects
+  ws.onclose = () => { linkUp = false; scheduleReconnect(); };
+  ws.onerror = () => { /* an onclose always follows; reconnect happens there */ };
+}
+function scheduleReconnect() {
+  setTimeout(connectStream, reconnectDelay);
+  reconnectDelay = Math.min(reconnectDelay * 1.6, 8000);  // capped backoff
 }
 connectStream();
 
@@ -349,50 +364,121 @@ function toWorld(sx, sy) {
 }
 
 // ---------------------------------------------------------------------------
-// Pointer: drag to pan, wheel to zoom, click to select a star.
+// Pointer: 1 finger/mouse = pan, 2 fingers = pinch-zoom, wheel = zoom,
+// tap/click = select a star. Multi-touch is tracked via pointer events.
 // ---------------------------------------------------------------------------
-const pointer = { down: false, dragging: false, sx: 0, sy: 0, camX: 0, camY: 0 };
+const pointers = new Map();        // pointerId -> {x, y} (canvas-relative)
+let panning = false;
+let pinch = null;                  // {startDist, startZoom, anchor:{x,y}}
+let gestureMoved = false;          // true once a drag/pinch happened (suppresses tap)
+const panStart = { sx: 0, sy: 0, camX: 0, camY: 0 };
+
+const DOUBLE_TAP_MS = 300;         // max gap between taps to count as a double-tap
+const DOUBLE_TAP_DIST = 30;        // max movement (screen px) between the two taps
+let lastTap = { t: 0, x: 0, y: 0 };
+
+// Double-tap / double-click: zoom in toward the point, or back out to fit if
+// already zoomed in. Uses camTarget so the camera easing animates it smoothly.
+function doubleTapZoom(sx, sy) {
+  if (cam.zoom <= minZoom() * 1.2) {
+    const before = toWorld(sx, sy);
+    const nz = clamp(cam.zoom * 2.4, minZoom(), CONFIG.zoomMax);
+    camTarget.zoom = nz;
+    camTarget.x = before.x - (sx - world.w / 2) / nz;
+    camTarget.y = before.y - (sy - world.h / 2) / nz;
+  } else {
+    fitView();
+  }
+}
+
+function canvasXY(e) {
+  const r = canvas.getBoundingClientRect();
+  return { x: e.clientX - r.left, y: e.clientY - r.top };
+}
+function activePoints() { return [...pointers.values()]; }
+
+function beginPan(p) {
+  panning = true;
+  panStart.sx = p.x; panStart.sy = p.y;
+  panStart.camX = camTarget.x; panStart.camY = camTarget.y;
+}
+function beginPinch() {
+  panning = false;
+  const [a, b] = activePoints();
+  const dist = Math.hypot(a.x - b.x, a.y - b.y) || 1;
+  const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+  pinch = { startDist: dist, startZoom: cam.zoom, anchor: toWorld(mid.x, mid.y) };
+}
 
 canvas.addEventListener('pointerdown', (e) => {
-  const rect = canvas.getBoundingClientRect();
-  pointer.down = true;
-  pointer.dragging = false;
-  pointer.sx = e.clientX - rect.left;
-  pointer.sy = e.clientY - rect.top;
-  pointer.camX = camTarget.x;
-  pointer.camY = camTarget.y;
+  pointers.set(e.pointerId, canvasXY(e));
+  gestureMoved = false;
+  if (pointers.size === 1) beginPan(activePoints()[0]);
+  else if (pointers.size === 2) beginPinch();
 });
 
 window.addEventListener('pointermove', (e) => {
-  if (!pointer.down) return;
-  const rect = canvas.getBoundingClientRect();
-  const sx = e.clientX - rect.left;
-  const sy = e.clientY - rect.top;
-  const dx = sx - pointer.sx;
-  const dy = sy - pointer.sy;
-  if (!pointer.dragging && Math.hypot(dx, dy) > 5) pointer.dragging = true;
-  if (pointer.dragging) {
-    cam.x = camTarget.x = pointer.camX - dx / cam.zoom;
-    cam.y = camTarget.y = pointer.camY - dy / cam.zoom;
+  if (!pointers.has(e.pointerId)) return;
+  pointers.set(e.pointerId, canvasXY(e));
+
+  // Two fingers: pinch-zoom, keeping the world point under the midpoint fixed
+  // (finger translation also pans, which feels natural).
+  if (pointers.size >= 2 && pinch) {
+    const [a, b] = activePoints();
+    const dist = Math.hypot(a.x - b.x, a.y - b.y) || 1;
+    const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+    const nz = clamp(pinch.startZoom * (dist / pinch.startDist), minZoom(), CONFIG.zoomMax);
+    cam.zoom = camTarget.zoom = nz;
+    cam.x = camTarget.x = pinch.anchor.x - (mid.x - world.w / 2) / nz;
+    cam.y = camTarget.y = pinch.anchor.y - (mid.y - world.h / 2) / nz;
+    gestureMoved = true;
+    return;
+  }
+
+  // One finger/mouse: pan.
+  if (panning && pointers.size === 1) {
+    const p = activePoints()[0];
+    const dx = p.x - panStart.sx;
+    const dy = p.y - panStart.sy;
+    if (Math.hypot(dx, dy) > 5) gestureMoved = true;
+    cam.x = camTarget.x = panStart.camX - dx / cam.zoom;
+    cam.y = camTarget.y = panStart.camY - dy / cam.zoom;
   }
 });
 
-window.addEventListener('pointerup', (e) => {
-  if (!pointer.down) return;
-  pointer.down = false;
-  if (pointer.dragging) { pointer.dragging = false; return; }
+function endPointer(e) {
+  if (!pointers.has(e.pointerId)) return;
+  const last = canvasXY(e);
+  pointers.delete(e.pointerId);
 
-  const rect = canvas.getBoundingClientRect();
-  const w = toWorld(e.clientX - rect.left, e.clientY - rect.top);
-  const hit = userAt(w.x, w.y);
-  if (hit) {
-    selectedUserId = hit.id;
-    showStarInfo();
-  } else {
-    selectedUserId = null;
-    hideStarInfo();
+  if (pointers.size === 1) {
+    // Dropped from pinch back to a single finger — rebaseline the pan so the
+    // remaining finger doesn't cause a jump.
+    pinch = null;
+    beginPan(activePoints()[0]);
+  } else if (pointers.size === 0) {
+    // A clean tap (no drag/pinch): double-tap zooms, single tap selects.
+    if (!gestureMoved) {
+      const now = performance.now();
+      const isDouble = (now - lastTap.t) < DOUBLE_TAP_MS
+        && Math.hypot(last.x - lastTap.x, last.y - lastTap.y) < DOUBLE_TAP_DIST;
+      if (isDouble) {
+        doubleTapZoom(last.x, last.y);
+        lastTap.t = 0;                  // reset so a 3rd tap doesn't chain
+      } else {
+        lastTap = { t: now, x: last.x, y: last.y };
+        const w = toWorld(last.x, last.y);
+        const hit = userAt(w.x, w.y);
+        if (hit) { selectedUserId = hit.id; showStarInfo(); }
+        else { selectedUserId = null; hideStarInfo(); }
+      }
+    }
+    panning = false;
+    pinch = null;
   }
-});
+}
+window.addEventListener('pointerup', endPointer);
+window.addEventListener('pointercancel', endPointer);
 
 canvas.addEventListener('wheel', (e) => {
   e.preventDefault();
@@ -447,6 +533,15 @@ function render(time) {
   const z = cam.zoom;
   applyCamera();
 
+  // Visible world rectangle (+ margin for glow/labels near the edge). With
+  // thousands of stars, skipping everything off-screen is the single biggest
+  // client-side win — we only pay to draw what the camera can actually see.
+  const cullMargin = 80;
+  const halfW = world.w / 2 / z + cullMargin;
+  const halfH = world.h / 2 / z + cullMargin;
+  const viewMinX = cam.x - halfW, viewMaxX = cam.x + halfW;
+  const viewMinY = cam.y - halfH, viewMaxY = cam.y + halfH;
+
   // --- Background starfield (screen space, parallax + twinkle) ---
   for (const st of bgStars) {
     const shiftX = (cam.x * 0.03 * st.depth) % world.w;
@@ -468,8 +563,12 @@ function render(time) {
   ensureLabels(sectorLabelLayer, sectorLabelPool, n, 0, 0);
   for (let i = 0; i < n; i++) {
     const o = sectorOrigin(i);
-    sectorGfx.rect(o.x, o.y, S, S).stroke(sectorStroke);
     const lbl = sectorLabelPool[i];
+    if (o.x > viewMaxX || o.x + S < viewMinX || o.y > viewMaxY || o.y + S < viewMinY) {
+      lbl.visible = false;
+      continue;  // sector fully off-screen
+    }
+    sectorGfx.rect(o.x, o.y, S, S).stroke(sectorStroke);
     if (showSectorLabel) {
       lbl.visible = true;
       setLabel(lbl, `SECTOR · ${sectorName(i).toUpperCase()}`, 0x96cdeb);
@@ -503,6 +602,11 @@ function render(time) {
   ensureLabels(starLabelLayer, starLabelPool, users.length, 0.5, 1);
   starGfx.clear();
   users.forEach((u, idx) => {
+    if (u.x < viewMinX || u.x > viewMaxX || u.y < viewMinY || u.y > viewMaxY) {
+      starGlowPool[idx].visible = false;
+      starLabelPool[idx].visible = false;
+      return;  // off-screen star: skip glow, body and label entirely
+    }
     const pulse = u.pulse;
     const vis = 0.2 + 0.8 * u.pullForce;
 
@@ -574,6 +678,7 @@ function drawStarShape(x, y, r, pulse, vis) {
 // ---------------------------------------------------------------------------
 const hud = {
   probes: document.getElementById('hud-probes'),
+  spawn: document.getElementById('hud-spawn'),
   users: document.getElementById('hud-users'),
   sectors: document.getElementById('hud-sectors'),
   collisions: document.getElementById('hud-collisions'),
@@ -587,6 +692,7 @@ function updateHud(dt, fps) {
   hudTimer = 0.15;
   const online = users.reduce((a, u) => a + (u.loggedIn ? 1 : 0), 0);
   hud.probes.textContent = `${probes.length} / ${maxProbes}`;
+  hud.spawn.textContent = `every ${spawnInterval.toFixed(1)}s`;
   hud.users.textContent = `${online} / ${users.length} online`;
   hud.sectors.textContent = String(sectorCount());
   hud.collisions.textContent = String(collisionCount);
