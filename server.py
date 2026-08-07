@@ -342,8 +342,12 @@ class Sim:
             "hits": int(d.get("hits", 0)),
             "createdAt": int(d.get("createdAt", now_ms())),
             "loggedIn": logged_in,
-            "pullForce": 1.0 if logged_in else 0.0,
+            "pullForce": 0.6 if logged_in else 0.0,
             "pulse": 0.0,
+            "heartbeatUntil": 0,
+            "jammedUntil": 0,
+            "jamStack": 0,
+            "jamCooldowns": {},
             "x": 0.0, "y": 0.0, "sector": 0,
         }
 
@@ -432,6 +436,48 @@ class Sim:
             }
         }
 
+    def effective_pull_target(self, u):
+        if not u.get("loggedIn", False):
+            return 0.0
+        base = 1.0 if int(u.get("heartbeatUntil", 0) or 0) > now_ms() else 0.6
+        jam_stack = int(u.get("jamStack", 0) or 0)
+        if int(u.get("jammedUntil", 0) or 0) > now_ms() and jam_stack > 0:
+            base = max(0.3, base - 0.1 * jam_stack)
+        return base
+
+    def heartbeat_user(self, uid: int, token: str = None):
+        for u in self.users:
+            if u["id"] != uid:
+                continue
+            if not token or not u.get("token") or not secrets.compare_digest(u["token"], token):
+                return {"ok": False, "error": "unauthorized"}
+            if not u.get("loggedIn", False):
+                return {"ok": False, "error": "offline"}
+            u["heartbeatUntil"] = now_ms() + 4000
+            self.dirty = True
+            return {"ok": True}
+        return {"ok": False, "error": "not_found"}
+
+    def jam_user(self, jammer_id: int, target_id: int, token: str = None):
+        jammer = next((u for u in self.users if u["id"] == jammer_id), None)
+        target = next((u for u in self.users if u["id"] == target_id), None)
+        if not jammer or not target:
+            return {"ok": False, "error": "not_found"}
+        if not token or not jammer.get("token") or not secrets.compare_digest(jammer["token"], token):
+            return {"ok": False, "error": "unauthorized"}
+        if jammer_id == target_id:
+            return {"ok": False, "error": "self_target"}
+        cooldowns = jammer.get("jamCooldowns") or {}
+        cooldown_until = int(cooldowns.get(str(target_id), 0) or 0)
+        if cooldown_until > now_ms():
+            return {"ok": False, "error": "cooldown"}
+        cooldowns[str(target_id)] = now_ms() + 30000
+        jammer["jamCooldowns"] = cooldowns
+        target["jamStack"] = int(target.get("jamStack", 0) or 0) + 1
+        target["jammedUntil"] = max(int(target.get("jammedUntil", 0) or 0), now_ms() + 15000)
+        self.dirty = True
+        return {"ok": True}
+
     def set_logged_in(self, uid: int, value: bool, token: str = None):
         """Toggle online/offline status for a star. Requires token authorization."""
         for u in self.users:
@@ -439,6 +485,10 @@ class Sim:
                 if not token or not u.get("token") or not secrets.compare_digest(u["token"], token):
                     return {"ok": False, "error": "unauthorized"}
                 u["loggedIn"] = bool(value)
+                if not u["loggedIn"]:
+                    u["heartbeatUntil"] = 0
+                    u["jammedUntil"] = 0
+                    u["jamStack"] = 0
                 self.rev += 1
                 self.dirty = True
                 return {"ok": True}
@@ -529,14 +579,18 @@ class Sim:
             self.spawn_timer = self.spawn_interval()
 
         ease = min(1.0, dt * PULL_FADE)
+        now = now_ms()
         any_active = False
         for u in self.users:
-            target = 1.0 if u["loggedIn"] else 0.0
+            target = self.effective_pull_target(u)
             u["pullForce"] += (target - u["pullForce"]) * ease
             if u["pullForce"] > PULL_MIN:
                 any_active = True
             if u["pulse"] > 0:
                 u["pulse"] = max(0.0, u["pulse"] - dt * 2.2)
+            if int(u.get("jammedUntil", 0) or 0) <= now:
+                u["jammedUntil"] = 0
+                u["jamStack"] = 0
 
         bw, bh = self.world_size()
         # (Re)build the spatial grid only when the roster changed. Ring search
@@ -634,7 +688,7 @@ class Sim:
                 "r": round(u["r"], 2), "hits": u["hits"],
                 "loggedIn": u["loggedIn"], "pull": round(u["pullForce"], 3),
                 "pulse": round(u["pulse"], 3), "createdAt": u["createdAt"],
-                "sector": u["sector"],
+                "sector": u["sector"], "jamStack": int(u.get("jamStack", 0) or 0),
             } for u in self.users]
         return snap
 
@@ -663,6 +717,8 @@ class Sim:
                 "token": u.get("token", ""),
                 "fx": u["fx"], "fy": u["fy"], "r": u["r"],
                 "hits": u["hits"], "createdAt": u["createdAt"], "loggedIn": u["loggedIn"],
+                "heartbeatUntil": u.get("heartbeatUntil", 0), "jammedUntil": u.get("jammedUntil", 0),
+                "jamStack": u.get("jamStack", 0), "jamCooldowns": u.get("jamCooldowns", {}),
             } for u in self.users],
         }
         return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
@@ -783,6 +839,17 @@ class LoginReq(BaseModel):
     token: str = ""
 
 
+class HeartbeatReq(BaseModel):
+    id: int
+    token: str = ""
+
+
+class JamReq(BaseModel):
+    id: int
+    target_id: int
+    token: str = ""
+
+
 @app.get("/api/health")
 async def api_health():
     # Deliberately cheap — no roster serialization — so probes stay light even
@@ -824,6 +891,42 @@ async def api_reset():
     res = sim.reset()
     await persist_now()
     return res
+
+
+@app.post("/api/heartbeat")
+async def api_heartbeat(req: HeartbeatReq):
+    res = sim.heartbeat_user(req.id, req.token)
+    if res.get("ok"):
+        await persist_now()
+        return JSONResponse(res, status_code=200)
+    status_code = 403 if res.get("error") == "unauthorized" else 400
+    return JSONResponse(res, status_code=status_code)
+
+
+@app.post("/api/jam")
+async def api_jam(req: JamReq):
+    res = sim.jam_user(req.id, req.target_id, req.token)
+    if res.get("ok"):
+        await persist_now()
+        return JSONResponse(res, status_code=200)
+    status_code = 403 if res.get("error") == "unauthorized" else 400
+    return JSONResponse(res, status_code=status_code)
+
+
+@app.get("/api/leaderboard")
+async def api_leaderboard():
+    users = sorted(sim.users, key=lambda u: (-u.get("hits", 0), u.get("name", "")))
+    return JSONResponse({
+        "ok": True,
+        "users": [{
+            "id": u["id"],
+            "name": u["name"],
+            "hits": u["hits"],
+            "r": round(u["r"], 2),
+            "sector": u.get("sector", 0),
+            "loggedIn": u.get("loggedIn", False),
+        } for u in users],
+    })
 
 
 @app.websocket("/ws")

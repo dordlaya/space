@@ -74,6 +74,83 @@ html, body {
   padding: 0 16px;
 }
 
+.leaderboard-panel {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  width: min(28vw, 280px);
+  max-height: min(70vh, 520px);
+  padding: 12px 12px 10px;
+  background: rgba(8, 16, 26, 0.55);
+  border: 1px solid rgba(159, 231, 255, 0.18);
+  border-radius: 10px;
+  backdrop-filter: blur(6px);
+  color: var(--hud-fg);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.leaderboard-title {
+  font-size: 11px;
+  color: var(--hud-dim);
+  letter-spacing: 0.22em;
+  margin-bottom: 8px;
+}
+
+.leaderboard-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: calc(min(70vh, 520px) - 34px);
+  overflow: auto;
+}
+
+.leaderboard-row {
+  display: grid;
+  grid-template-columns: 38px 1fr auto 10px;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 8px;
+  border-radius: 8px;
+  background: rgba(159, 231, 255, 0.06);
+}
+
+.leaderboard-row.self {
+  outline: 1px solid rgba(124, 255, 155, 0.3);
+}
+
+.leaderboard-rank {
+  color: #bfe9ff;
+  font-weight: 600;
+}
+
+.leaderboard-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.leaderboard-meta {
+  color: var(--hud-dim);
+  font-size: 11px;
+  text-align: right;
+}
+
+.leaderboard-status {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.leaderboard-status.online { background: #7CFF9B; }
+.leaderboard-status.offline { background: #7b8a95; }
+
+.leaderboard-empty {
+  color: var(--hud-dim);
+  padding: 8px 2px;
+}
+
 /* --- Login page --- */
 #login {
   position: absolute;

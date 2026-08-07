@@ -257,7 +257,7 @@ function applySnapshot(snap) {
     users = snap.users.map((s) => ({
       id: s.id, name: s.name, x: s.x, y: s.y, r: s.r, hits: s.hits,
       loggedIn: s.loggedIn, pullForce: s.pull, pulse: s.pulse,
-      createdAt: s.createdAt, sector: s.sector,
+      createdAt: s.createdAt, sector: s.sector, jamStack: s.jamStack || 0,
     }));
   }
 
@@ -283,6 +283,7 @@ function applySnapshot(snap) {
   if (hasUsers && snap.rev !== serverRev) {
     serverRev = snap.rev;
     refreshLoginUI();
+    renderLeaderboard();
     if (selectedUserId !== null && !getUserById(selectedUserId)) {
       selectedUserId = null;
       hideStarInfo();
@@ -367,6 +368,24 @@ async function apiLogin(id, value) {
 }
 async function apiReset() {
   try { await fetch('/api/reset', { method: 'POST' }); } catch { /* ignore */ }
+}
+async function apiHeartbeat() {
+  if (!currentSession) return;
+  try {
+    await fetch('/api/heartbeat', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: currentSession.id, token: currentSession.token }),
+    });
+  } catch { /* ignore */ }
+}
+async function apiJam(targetId) {
+  if (!currentSession || !targetId) return;
+  try {
+    await fetch('/api/jam', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: currentSession.id, target_id: targetId, token: currentSession.token }),
+    });
+  } catch { /* ignore */ }
 }
 
 // ---------------------------------------------------------------------------
@@ -501,8 +520,16 @@ function endPointer(e) {
         lastTap = { t: now, x: last.x, y: last.y };
         const w = toWorld(last.x, last.y);
         const hit = userAt(w.x, w.y);
-        if (hit) { selectedUserId = hit.id; showStarInfo(); }
-        else { selectedUserId = null; hideStarInfo(); }
+        if (hit) {
+          selectedUserId = hit.id;
+          showStarInfo();
+          if (currentSession && hit.id !== currentSession.id) {
+            apiJam(hit.id);
+          }
+        } else {
+          selectedUserId = null;
+          hideStarInfo();
+        }
       }
     }
     panning = false;
@@ -652,6 +679,10 @@ function render(time) {
     if (pulse > 0) {
       starGfx.circle(u.x, u.y, u.r + 6 + (1 - pulse) * 16)
         .stroke({ width: 2 / z, color: 0xffd282, alpha: pulse });
+    }
+    if (u.jamStack > 0) {
+      starGfx.circle(u.x, u.y, u.r + 10 + u.jamStack * 2)
+        .stroke({ width: 1.2 / z, color: 0xffc96d, alpha: 0.45 });
     }
     drawStarShape(u.x, u.y, u.r, pulse, vis);
     if (u.id === selectedUserId) {
@@ -939,6 +970,8 @@ async function doAuth() {
     }
     clearLoginError();
     saveSession(res.user);
+    apiHeartbeat();
+    startHeartbeatLoop();
     login.password.value = '';
     fitPending = true;      // fit once the user star shows up in a snapshot
     hideLogin();
@@ -949,8 +982,26 @@ async function doAuth() {
   }
 }
 
+let heartbeatTimer = null;
+const HEARTBEAT_INTERVAL_MS = 50000;
+
+function startHeartbeatLoop() {
+  if (heartbeatTimer || !currentSession) return;
+  heartbeatTimer = setInterval(() => {
+    if (!currentSession) return;
+    apiHeartbeat();
+  }, HEARTBEAT_INTERVAL_MS);
+}
+function stopHeartbeatLoop() {
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  }
+}
+
 function logoutSession() {
   saveSession(null);
+  stopHeartbeatLoop();
   login.password.value = '';
   refreshLoginUI();
   clearLoginError();
@@ -976,6 +1027,39 @@ login.reset.addEventListener('click', (e) => {
 });
 
 showLogin();
+if (currentSession) startHeartbeatLoop();
+
+// ---------------------------------------------------------------------------
+// Leaderboard panel
+// ---------------------------------------------------------------------------
+const leaderboard = {
+  panel: document.getElementById('leaderboard'),
+  list: document.getElementById('leaderboard-list'),
+};
+
+function renderLeaderboard() {
+  const rows = [...users].sort((a, b) => (b.hits - a.hits) || a.name.localeCompare(b.name));
+  leaderboard.list.innerHTML = '';
+  if (!rows.length) {
+    const empty = document.createElement('div');
+    empty.className = 'leaderboard-empty';
+    empty.textContent = 'No stars yet';
+    leaderboard.list.appendChild(empty);
+    return;
+  }
+  rows.forEach((u, index) => {
+    const row = document.createElement('div');
+    row.className = 'leaderboard-row' + (currentSession && u.id === currentSession.id ? ' self' : '');
+    row.innerHTML = `
+      <span class="leaderboard-rank">#${index + 1}</span>
+      <span class="leaderboard-name">${u.name}</span>
+      <span class="leaderboard-meta">${u.hits} · ${u.r.toFixed(1)}</span>
+      <span class="leaderboard-status ${u.loggedIn ? 'online' : 'offline'}"></span>
+    `;
+    leaderboard.list.appendChild(row);
+  });
+}
+renderLeaderboard();
 
 // ---------------------------------------------------------------------------
 // Star info panel
