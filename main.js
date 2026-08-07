@@ -1076,10 +1076,23 @@ const starInfo = {
   growth: document.getElementById('si-growth'),
   pos: document.getElementById('si-pos'),
   born: document.getElementById('si-born'),
+  heartbeat: document.getElementById('si-heartbeat'),
+  jam: document.getElementById('si-jam'),
   toggle: document.getElementById('si-toggle'),
   close: document.getElementById('si-close'),
 };
 starInfo.close.addEventListener('click', () => { selectedUserId = null; hideStarInfo(); });
+starInfo.heartbeat.addEventListener('click', async () => {
+  if (!currentSession) return;
+  await apiHeartbeat();
+  updateStarInfo();
+});
+starInfo.jam.addEventListener('click', async () => {
+  const u = getUserById(selectedUserId);
+  if (!u || !currentSession || u.id === currentSession.id) return;
+  await apiJam(u.id);
+  updateStarInfo();
+});
 starInfo.toggle.addEventListener('click', () => {
   const u = getUserById(selectedUserId);
   if (!u) return;
@@ -1118,6 +1131,11 @@ function updateStarInfo() {
   starInfo.born.textContent = new Date(u.createdAt).toLocaleTimeString();
   
   const isOwner = currentSession && u.id === currentSession.id;
+  starInfo.heartbeat.classList.toggle('hidden', !isOwner || !u.loggedIn);
+  starInfo.jam.classList.toggle('hidden', !currentSession || isOwner || !u.loggedIn);
+  starInfo.heartbeat.disabled = !u.loggedIn;
+  starInfo.jam.disabled = !u.loggedIn;
+
   if (isOwner) {
     starInfo.toggle.classList.remove('read-only');
     starInfo.toggle.disabled = false;

@@ -410,6 +410,29 @@ html, body {
 }
 #star-info.hidden { display: none; }
 
+.si-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.si-action-btn {
+  flex: 1;
+  padding: 8px 10px;
+  font-family: var(--font);
+  font-size: 12px;
+  color: #04121a;
+  background: linear-gradient(180deg, #9fe7ff, #5cc6f0);
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+}
+.si-action-btn.hidden { display: none; }
+.si-action-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 .si-name {
   font-size: 15px;
   letter-spacing: 0.06em;
