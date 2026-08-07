@@ -284,6 +284,7 @@ function applySnapshot(snap) {
     serverRev = snap.rev;
     refreshLoginUI();
     renderLeaderboard();
+    updateMapButtons();
     if (selectedUserId !== null && !getUserById(selectedUserId)) {
       selectedUserId = null;
       hideStarInfo();
@@ -381,11 +382,12 @@ async function apiHeartbeat() {
 async function apiJam(targetId) {
   if (!currentSession || !targetId) return;
   try {
-    await fetch('/api/jam', {
+    return fetch('/api/jam', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ id: currentSession.id, target_id: targetId, token: currentSession.token }),
     });
   } catch { /* ignore */ }
+  return Promise.resolve(null);
 }
 
 // ---------------------------------------------------------------------------
@@ -523,12 +525,11 @@ function endPointer(e) {
         if (hit) {
           selectedUserId = hit.id;
           showStarInfo();
-          if (currentSession && hit.id !== currentSession.id) {
-            apiJam(hit.id);
-          }
+          updateMapButtons();
         } else {
           selectedUserId = null;
           hideStarInfo();
+          updateMapButtons();
         }
       }
     }
@@ -1000,11 +1001,20 @@ function stopHeartbeatLoop() {
 }
 
 function logoutSession() {
+  if (currentSession) {
+    const self = getUserById(currentSession.id);
+    if (self && self.loggedIn) {
+      apiLogin(currentSession.id, false);
+    }
+  }
   saveSession(null);
   stopHeartbeatLoop();
+  selectedUserId = null;
+  hideStarInfo();
   login.password.value = '';
   refreshLoginUI();
   clearLoginError();
+  showLogin();
 }
 
 login.join.addEventListener('click', doAuth);
@@ -1028,6 +1038,100 @@ login.reset.addEventListener('click', (e) => {
 
 showLogin();
 if (currentSession) startHeartbeatLoop();
+
+const mapButtons = {
+  goDark: document.getElementById('map-go-dark'),
+  logout: document.getElementById('map-logout'),
+  heartbeat: document.getElementById('map-heartbeat'),
+  jam: document.getElementById('map-jam'),
+};
+
+let heartbeatCooldownUntil = 0;
+let jamCooldownUntil = 0;
+let actionTimer = null;
+
+function formatCooldown(ms) {
+  const total = Math.max(0, Math.ceil(ms / 1000));
+  if (total >= 60) {
+    const mins = Math.floor(total / 60);
+    const secs = total % 60;
+    return `${mins}m${secs ? `:${secs.toString().padStart(2, '0')}` : ''}`;
+  }
+  return `${total}s`;
+}
+
+function updateMapButtons() {
+  const isLoggedIn = Boolean(currentSession && getUserById(currentSession.id)?.loggedIn);
+  mapButtons.goDark.classList.toggle('hidden', !currentSession || !isLoggedIn);
+  mapButtons.logout.classList.toggle('hidden', !currentSession);
+  const self = currentSession ? getUserById(currentSession.id) : null;
+  const canHeartbeat = Boolean(currentSession && self && self.loggedIn);
+  mapButtons.heartbeat.classList.toggle('hidden', !canHeartbeat);
+  const selected = selectedUserId !== null ? getUserById(selectedUserId) : null;
+  const canJam = Boolean(currentSession && selected && selected.loggedIn && selected.id !== currentSession.id);
+  mapButtons.jam.classList.toggle('hidden', !canJam);
+
+  const heartbeatRemaining = Math.max(0, heartbeatCooldownUntil - Date.now());
+  mapButtons.heartbeat.disabled = heartbeatRemaining > 0;
+  if (heartbeatRemaining > 0) {
+    mapButtons.heartbeat.textContent = formatCooldown(heartbeatRemaining);
+  } else {
+    mapButtons.heartbeat.textContent = '♥';
+  }
+
+  const jamRemaining = Math.max(0, jamCooldownUntil - Date.now());
+  mapButtons.jam.disabled = jamRemaining > 0;
+  if (jamRemaining > 0) {
+    mapButtons.jam.textContent = formatCooldown(jamRemaining);
+  } else {
+    mapButtons.jam.textContent = '⚡';
+  }
+}
+
+function startActionTicker() {
+  if (actionTimer) return;
+  actionTimer = setInterval(updateMapButtons, 1000);
+}
+
+function stopActionTicker() {
+  if (actionTimer) {
+    clearInterval(actionTimer);
+    actionTimer = null;
+  }
+}
+
+mapButtons.goDark.addEventListener('click', async () => {
+  if (!currentSession) return;
+  const self = getUserById(currentSession.id);
+  if (self && self.loggedIn) {
+    await apiLogin(currentSession.id, false);
+  }
+  updateMapButtons();
+});
+
+mapButtons.logout.addEventListener('click', () => {
+  logoutSession();
+});
+
+mapButtons.heartbeat.addEventListener('click', async () => {
+  if (!currentSession) return;
+  if (Date.now() < heartbeatCooldownUntil) return;
+  await apiHeartbeat();
+  heartbeatCooldownUntil = Date.now() + 55000;
+  updateMapButtons();
+});
+
+mapButtons.jam.addEventListener('click', async () => {
+  if (!currentSession || selectedUserId === null) return;
+  const target = getUserById(selectedUserId);
+  if (!target || target.id === currentSession.id || Date.now() < jamCooldownUntil) return;
+  await apiJam(target.id);
+  jamCooldownUntil = Date.now() + 600000;
+  updateMapButtons();
+});
+
+startActionTicker();
+updateMapButtons();
 
 // ---------------------------------------------------------------------------
 // Leaderboard panel
@@ -1131,10 +1235,8 @@ function updateStarInfo() {
   starInfo.born.textContent = new Date(u.createdAt).toLocaleTimeString();
   
   const isOwner = currentSession && u.id === currentSession.id;
-  starInfo.heartbeat.classList.toggle('hidden', !isOwner || !u.loggedIn);
-  starInfo.jam.classList.toggle('hidden', !currentSession || isOwner || !u.loggedIn);
-  starInfo.heartbeat.disabled = !u.loggedIn;
-  starInfo.jam.disabled = !u.loggedIn;
+  starInfo.heartbeat.classList.add('hidden');
+  starInfo.jam.classList.add('hidden');
 
   if (isOwner) {
     starInfo.toggle.classList.remove('read-only');

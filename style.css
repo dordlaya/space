@@ -74,6 +74,52 @@ html, body {
   padding: 0 16px;
 }
 
+.map-action-pill {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  padding: 8px 12px;
+  font-family: var(--font);
+  font-size: 12px;
+  color: #04121a;
+  background: linear-gradient(180deg, #9fe7ff, #5cc6f0);
+  border: none;
+  border-radius: 999px;
+  cursor: pointer;
+  z-index: 9;
+}
+.map-action-pill.hidden { display: none; }
+
+.map-logout-pill {
+  top: 56px;
+  color: #ffe9c2;
+  background: rgba(255, 155, 155, 0.16);
+  border: 1px solid rgba(255, 155, 155, 0.3);
+}
+
+.map-round-btn {
+  position: absolute;
+  left: 20px;
+  width: 56px;
+  height: 56px;
+  border: none;
+  border-radius: 50%;
+  font-family: var(--font);
+  font-size: 22px;
+  color: #04121a;
+  background: linear-gradient(180deg, #9fe7ff, #5cc6f0);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
+  cursor: pointer;
+  z-index: 9;
+}
+.map-round-btn.hidden { display: none; }
+.map-round-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.heartbeat-btn { bottom: 98px; }
+.jam-btn { bottom: 24px; }
+
 .leaderboard-panel {
   position: absolute;
   top: 16px;
