@@ -375,6 +375,11 @@ class Sim:
             existing_by_email["loggedIn"] = True
             self.rev += 1
             self.dirty = True
+            print(
+                f"[auth] LOGIN   name={existing_by_email['name']!r:16}  "
+                f"email={existing_by_email['email']}  id={existing_by_email['id']}",
+                flush=True,
+            )
             return {
                 "ok": True,
                 "user": {
@@ -412,6 +417,11 @@ class Sim:
         self._grid_dirty = True
         self.rev += 1
         self.dirty = True
+        print(
+            f"[auth] REGISTER name={u['name']!r:16}  "
+            f"email={u['email']}  id={u['id']}",
+            flush=True,
+        )
         return {
             "ok": True,
             "user": {
@@ -693,13 +703,18 @@ async def persist_now():
         if persistence.mode == PersistenceMode.VALKEY:
             # Valkey set is fast enough to call inline (no thread executor needed)
             ok = persistence.save(data)
+            if ok:
+                print(f"[persist] saved {len(data)} bytes → valkey key={VALKEY_KEY}", flush=True)
         else:
             ok = await asyncio.get_running_loop().run_in_executor(
                 None, persistence.save, data)
+            if ok:
+                print(f"[persist] saved {len(data)} bytes → local {ROSTER_PATH}", flush=True)
         if not ok:
             sim.dirty = True
     except OSError:
         sim.dirty = True  # try again on the next autosave
+
 
 
 # --- simulation task (single event loop, no locks) --------------------------
