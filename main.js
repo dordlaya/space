@@ -316,20 +316,46 @@ function scheduleReconnect() {
 connectStream();
 
 // ---------------------------------------------------------------------------
+// Session state (stored in localStorage)
+// ---------------------------------------------------------------------------
+let currentSession = null; // { id, name, email, token }
+
+function loadSession() {
+  try {
+    const raw = localStorage.getItem('space_map_session');
+    if (raw) currentSession = JSON.parse(raw);
+  } catch {
+    currentSession = null;
+  }
+}
+function saveSession(sess) {
+  currentSession = sess;
+  if (sess) {
+    localStorage.setItem('space_map_session', JSON.stringify(sess));
+  } else {
+    localStorage.removeItem('space_map_session');
+  }
+}
+loadSession();
+
+// ---------------------------------------------------------------------------
 // Server actions (client input -> authoritative server)
 // ---------------------------------------------------------------------------
-async function apiJoin(name) {
-  const res = await fetch('/api/join', {
+async function apiAuth(email, name, password) {
+  const res = await fetch('/api/auth', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name }),
+    body: JSON.stringify({ email, name, password }),
   });
   return res.json();
 }
 async function apiLogin(id, value) {
+  if (!currentSession || currentSession.id !== id) {
+    return; // UI protection: only owner can toggle their own star
+  }
   try {
     await fetch('/api/login', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id, value }),
+      body: JSON.stringify({ id, value, token: currentSession.token }),
     });
   } catch { /* will resync on next snapshot */ }
 }
@@ -787,11 +813,17 @@ document.addEventListener('pointerdown', (e) => {
 });
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // Login page — actions now go to the authoritative server.
 // ---------------------------------------------------------------------------
 const login = {
   panel: document.getElementById('login'),
+  email: document.getElementById('email'),
   nickname: document.getElementById('nickname'),
+  password: document.getElementById('password'),
+  sessionBadge: document.getElementById('session-badge'),
+  sessionUserName: document.getElementById('session-user-name'),
+  logoutSessionBtn: document.getElementById('logout-session-btn'),
   join: document.getElementById('join-btn'),
   enter: document.getElementById('enter-btn'),
   list: document.getElementById('user-list'),
@@ -805,14 +837,16 @@ function showLogin() {
   login.panel.classList.remove('hidden');
   clearLoginError();
   refreshLoginUI();
-  setTimeout(() => login.nickname.focus(), 50);
+  setTimeout(() => {
+    if (currentSession) {
+      login.email.focus();
+    } else {
+      login.email.focus();
+    }
+  }, 50);
 }
 function hideLogin() { login.panel.classList.add('hidden'); }
 
-function userExists(name) {
-  const key = name.trim().toLowerCase();
-  return !!key && users.some((u) => u.name.toLowerCase() === key);
-}
 function showLoginError(msg) {
   login.error.textContent = msg;
   login.error.classList.remove('hidden');
@@ -826,6 +860,15 @@ const USER_LIST_LIMIT = 10;   // show the N most-recent users; rest behind a tog
 let showAllUsers = false;
 
 function refreshLoginUI() {
+  if (currentSession) {
+    login.sessionBadge.classList.remove('hidden');
+    login.sessionUserName.textContent = currentSession.name;
+    login.email.value = currentSession.email || '';
+    login.nickname.value = currentSession.name || '';
+  } else {
+    login.sessionBadge.classList.add('hidden');
+  }
+
   login.list.innerHTML = '';
 
   // Most-recently-joined first, so the "latest" users are always visible.
@@ -833,11 +876,17 @@ function refreshLoginUI() {
   const shown = showAllUsers ? ordered : ordered.slice(0, USER_LIST_LIMIT);
 
   for (const u of shown) {
+    const isSelf = currentSession && u.id === currentSession.id;
     const chip = document.createElement('span');
     chip.className = 'user-chip' + (u.loggedIn ? ' online' : '');
-    chip.textContent = u.name;
-    chip.title = u.loggedIn ? 'Logged in — click to log out' : 'Logged out — click to log in';
-    chip.addEventListener('click', () => { apiLogin(u.id, !u.loggedIn); });
+    chip.textContent = u.name + (isSelf ? ' (you)' : '');
+    if (isSelf) {
+      chip.title = u.loggedIn ? 'Your star (Online) — click to log out' : 'Your star (Offline) — click to log in';
+      chip.addEventListener('click', () => { apiLogin(u.id, !u.loggedIn); });
+    } else {
+      chip.title = `Star ${u.name} — click to view on map`;
+      chip.addEventListener('click', () => { focusStar(u); hideLogin(); });
+    }
     login.list.appendChild(chip);
   }
 
@@ -856,29 +905,36 @@ function refreshLoginUI() {
   login.addBtn.style.display = 'flex';
 }
 
-async function doJoin() {
+async function doAuth() {
+  const email = login.email.value.trim();
   const name = login.nickname.value.trim();
-  if (!name) { showLoginError('Please enter a nickname.'); login.nickname.focus(); return; }
-  // Fast client-side check for snappy feedback; the server is the real authority.
-  if (userExists(name)) {
-    showLoginError(`"${name}" is already taken — please choose a different name.`);
-    login.nickname.select();
-    return;
-  }
+  const password = login.password.value;
+
+  if (!email) { showLoginError('Please enter an email.'); login.email.focus(); return; }
+  if (!password) { showLoginError('Please enter a password.'); login.password.focus(); return; }
+
   login.join.disabled = true;
   try {
-    const res = await apiJoin(name);
+    const res = await apiAuth(email, name, password);
     if (!res.ok) {
-      const msg = res.error === 'name_taken'
-        ? `"${name}" is already taken — please choose a different name.`
-        : 'Could not join — please try again.';
+      let msg = 'Could not log in — please try again.';
+      if (res.error === 'invalid_credentials') {
+        msg = 'Invalid email or password.';
+        login.password.select();
+      } else if (res.error === 'missing_username') {
+        msg = 'Username is required to register a new star.';
+        login.nickname.focus();
+      } else if (res.error === 'name_taken') {
+        msg = `"${name}" is taken by another star — choose a different username.`;
+        login.nickname.select();
+      }
       showLoginError(msg);
-      login.nickname.select();
       return;
     }
     clearLoginError();
-    login.nickname.value = '';
-    fitPending = true;      // fit once the new user shows up in a snapshot
+    saveSession(res.user);
+    login.password.value = '';
+    fitPending = true;      // fit once the user star shows up in a snapshot
     hideLogin();
   } catch {
     showLoginError('Server unreachable — please try again.');
@@ -887,15 +943,28 @@ async function doJoin() {
   }
 }
 
-login.join.addEventListener('click', doJoin);
-login.nickname.addEventListener('keydown', (e) => { if (e.key === 'Enter') doJoin(); });
+function logoutSession() {
+  saveSession(null);
+  login.password.value = '';
+  refreshLoginUI();
+  clearLoginError();
+}
+
+login.join.addEventListener('click', doAuth);
+login.password.addEventListener('keydown', (e) => { if (e.key === 'Enter') doAuth(); });
+login.nickname.addEventListener('keydown', (e) => { if (e.key === 'Enter') doAuth(); });
+login.email.addEventListener('keydown', (e) => { if (e.key === 'Enter') doAuth(); });
+login.email.addEventListener('input', clearLoginError);
 login.nickname.addEventListener('input', clearLoginError);
+login.password.addEventListener('input', clearLoginError);
+login.logoutSessionBtn.addEventListener('click', logoutSession);
 login.enter.addEventListener('click', () => { hideLogin(); fitView(); });
 login.close.addEventListener('click', hideLogin);
 login.addBtn.addEventListener('click', showLogin);
 login.reset.addEventListener('click', (e) => {
   e.preventDefault();
   apiReset();
+  saveSession(null);
   selectedUserId = null;
   hideStarInfo();
 });
@@ -924,7 +993,9 @@ starInfo.close.addEventListener('click', () => { selectedUserId = null; hideStar
 starInfo.toggle.addEventListener('click', () => {
   const u = getUserById(selectedUserId);
   if (!u) return;
-  apiLogin(u.id, !u.loggedIn);   // server flips it; snapshot updates the panel
+  if (currentSession && u.id === currentSession.id) {
+    apiLogin(u.id, !u.loggedIn);   // server flips it; snapshot updates the panel
+  }
 });
 
 function showStarInfo() { starInfo.panel.classList.remove('hidden'); updateStarInfo(); }
@@ -955,7 +1026,17 @@ function updateStarInfo() {
   starInfo.growth.textContent = `+${(u.r - CONFIG.userRadius).toFixed(1)} px`;
   starInfo.pos.textContent = `${u.x.toFixed(0)}, ${u.y.toFixed(0)}`;
   starInfo.born.textContent = new Date(u.createdAt).toLocaleTimeString();
-  starInfo.toggle.textContent = u.loggedIn ? 'Log out' : 'Log in';
+  
+  const isOwner = currentSession && u.id === currentSession.id;
+  if (isOwner) {
+    starInfo.toggle.classList.remove('read-only');
+    starInfo.toggle.disabled = false;
+    starInfo.toggle.textContent = u.loggedIn ? 'Log out' : 'Log in';
+  } else {
+    starInfo.toggle.classList.add('read-only');
+    starInfo.toggle.disabled = true;
+    starInfo.toggle.textContent = 'Owned by another user';
+  }
 }
 
 // ---------------------------------------------------------------------------

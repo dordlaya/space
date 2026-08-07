@@ -37,11 +37,22 @@ Env: DATA_DIR (data folder), BIND (host, default 127.0.0.1), PORT (default 5173)
 """
 import asyncio
 import contextlib
+import hashlib
 import json
 import math
 import os
 import random
+import secrets
 import time
+
+def hash_password(password: str, salt: str = None) -> tuple[str, str]:
+    if not salt:
+        salt = secrets.token_hex(16)
+    pwd_hash = hashlib.pbkdf2_hmac(
+        'sha256', password.encode('utf-8'), salt.encode('utf-8'), 100000
+    ).hex()
+    return pwd_hash, salt
+
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
@@ -247,6 +258,10 @@ class Sim:
         return {
             "id": self.user_seq,
             "name": d.get("name", f"User{self.user_seq}"),
+            "email": d.get("email", ""),
+            "pwd_hash": d.get("pwd_hash", ""),
+            "pwd_salt": d.get("pwd_salt", ""),
+            "token": d.get("token") or secrets.token_hex(32),
             "fx": float(d.get("fx", random.random())),
             "fy": float(d.get("fy", random.random())),
             "r": float(d.get("r", USER_RADIUS)),
@@ -258,19 +273,64 @@ class Sim:
             "x": 0.0, "y": 0.0, "sector": 0,
         }
 
-    def add_user(self, name):
-        """Create a user + drop their planet. Enforces unique names.
+    def authenticate_or_create_user(self, name: str, email: str, password: str):
+        """Authenticate an existing user by email + password, or create a new user star."""
+        email_key = email.strip().lower()
+        name_key = name.strip()
+        if not email_key or not password:
+            return {"ok": False, "error": "missing_fields"}
 
-        Mutation only — the caller persists (see persist_now). Safe without a
-        lock: runs to completion on the event loop before the next tick."""
-        key = name.strip().lower()
-        if not key:
-            return {"ok": False, "error": "empty"}
-        if any(u["name"].strip().lower() == key for u in self.users):
+        # Search by email first
+        existing_by_email = next((u for u in self.users if u.get("email", "").strip().lower() == email_key), None)
+
+        if existing_by_email:
+            # Existing account: verify password
+            calc_hash, _ = hash_password(password, existing_by_email.get("pwd_salt", ""))
+            if not secrets.compare_digest(calc_hash, existing_by_email.get("pwd_hash", "")):
+                return {"ok": False, "error": "invalid_credentials"}
+            
+            # Successful authentication
+            if name_key and name_key != existing_by_email["name"]:
+                # Update username if new name provided and not taken by another user
+                if not any(u["name"].strip().lower() == name_key.lower() for u in self.users if u["id"] != existing_by_email["id"]):
+                    existing_by_email["name"] = name_key[:16]
+
+            if not existing_by_email.get("token"):
+                existing_by_email["token"] = secrets.token_hex(32)
+
+            existing_by_email["loggedIn"] = True
+            self.rev += 1
+            self.dirty = True
+            return {
+                "ok": True,
+                "user": {
+                    "id": existing_by_email["id"],
+                    "name": existing_by_email["name"],
+                    "email": existing_by_email["email"],
+                    "token": existing_by_email["token"],
+                }
+            }
+
+        # New account: verify name is available
+        if not name_key:
+            return {"ok": False, "error": "missing_username"}
+
+        if any(u["name"].strip().lower() == name_key.lower() for u in self.users):
             return {"ok": False, "error": "name_taken"}
+
+        # Create new user star
+        pwd_hash, pwd_salt = hash_password(password)
+        token = secrets.token_hex(32)
         sector = len(self.users) // STARS_PER_SECTOR
-        u = self._new_user({"name": name.strip()[:16] or None,
-                            "loggedIn": True, "createdAt": now_ms()})
+        u = self._new_user({
+            "name": name_key[:16],
+            "email": email_key,
+            "pwd_hash": pwd_hash,
+            "pwd_salt": pwd_salt,
+            "token": token,
+            "loggedIn": True,
+            "createdAt": now_ms()
+        })
         fx, fy = self.place_star_fraction(sector)
         u["fx"], u["fy"] = fx, fy
         self.users.append(u)
@@ -278,11 +338,22 @@ class Sim:
         self._grid_dirty = True
         self.rev += 1
         self.dirty = True
-        return {"ok": True, "id": u["id"]}
+        return {
+            "ok": True,
+            "user": {
+                "id": u["id"],
+                "name": u["name"],
+                "email": u["email"],
+                "token": u["token"],
+            }
+        }
 
-    def set_logged_in(self, uid, value):
+    def set_logged_in(self, uid: int, value: bool, token: str = None):
+        """Toggle online/offline status for a star. Requires token authorization."""
         for u in self.users:
             if u["id"] == uid:
+                if not token or not u.get("token") or not secrets.compare_digest(u["token"], token):
+                    return {"ok": False, "error": "unauthorized"}
                 u["loggedIn"] = bool(value)
                 self.rev += 1
                 self.dirty = True
@@ -507,7 +578,10 @@ class Sim:
         payload = {
             "rev": self.rev,
             "users": [{
-                "name": u["name"], "fx": u["fx"], "fy": u["fy"], "r": u["r"],
+                "name": u["name"], "email": u.get("email", ""),
+                "pwd_hash": u.get("pwd_hash", ""), "pwd_salt": u.get("pwd_salt", ""),
+                "token": u.get("token", ""),
+                "fx": u["fx"], "fy": u["fy"], "r": u["r"],
                 "hits": u["hits"], "createdAt": u["createdAt"], "loggedIn": u["loggedIn"],
             } for u in self.users],
         }
@@ -604,13 +678,16 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Space Map (authoritative)", lifespan=lifespan)
 
 
-class JoinReq(BaseModel):
+class AuthReq(BaseModel):
+    email: str = ""
     name: str = ""
+    password: str = ""
 
 
 class LoginReq(BaseModel):
     id: int
     value: bool = True
+    token: str = ""
 
 
 @app.get("/api/health")
@@ -626,20 +703,27 @@ async def api_state():
     return JSONResponse(sim.snapshot(include_users=True))
 
 
+@app.post("/api/auth")
 @app.post("/api/join")
-async def api_join(req: JoinReq):
-    res = sim.add_user(req.name)
+async def api_auth(req: AuthReq):
+    res = sim.authenticate_or_create_user(req.name, req.email, req.password)
     if res.get("ok"):
         await persist_now()
-    return res
+        return JSONResponse(res, status_code=200)
+    err = res.get("error")
+    status_code = 401 if err == "invalid_credentials" else 400
+    return JSONResponse(res, status_code=status_code)
 
 
 @app.post("/api/login")
 async def api_login(req: LoginReq):
-    res = sim.set_logged_in(req.id, req.value)
+    res = sim.set_logged_in(req.id, req.value, req.token)
     if res.get("ok"):
         await persist_now()
-    return JSONResponse(res, status_code=200 if res.get("ok") else 404)
+        return JSONResponse(res, status_code=200)
+    err = res.get("error")
+    status_code = 403 if err == "unauthorized" else 404
+    return JSONResponse(res, status_code=status_code)
 
 
 @app.post("/api/reset")
