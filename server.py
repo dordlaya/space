@@ -44,6 +44,13 @@ import os
 import random
 import secrets
 import time
+import enum
+
+# Optional redis import — only needed when PERSISTENCE_MODE=valkey
+try:
+    import redis
+except ImportError:
+    redis = None  # type: ignore
 
 def hash_password(password: str, salt: str = None) -> tuple[str, str]:
     if not salt:
@@ -67,6 +74,73 @@ ROSTER_PATH = os.path.join(DATA_DIR, "roster.json")
 _default_bind = "0.0.0.0" if os.environ.get("RENDER") else "127.0.0.1"
 HOST = os.environ.get("BIND", _default_bind)
 PORT = int(os.environ.get("PORT", "5173"))
+
+# --- persistence configuration -----------------------------------------------
+# Set PERSISTENCE_MODE=valkey to use Redis/Valkey; default is local roster.json.
+# Set VALKEY_URL to your Redis connection string when using Valkey mode.
+class PersistenceMode(enum.Enum):
+    ROSTER = "roster"   # local JSON file (default)
+    VALKEY = "valkey"   # Redis / Valkey
+
+PERSISTENCE_MODE = os.environ.get("PERSISTENCE_MODE", PersistenceMode.ROSTER.value).strip().lower()
+VALKEY_URL = os.environ.get("VALKEY_URL", "redis://red-d9pibof10e5c73dg1pe0:6379")
+VALKEY_KEY = "space:roster"   # single Redis key that holds the whole roster JSON
+
+
+class PersistenceManager:
+    """Thin abstraction over local-file vs Valkey (Redis) roster storage.
+
+    Mode is selected at startup via the PERSISTENCE_MODE env var:
+      roster (default) — reads/writes DATA_DIR/roster.json
+      valkey           — reads/writes a single Redis key (VALKEY_KEY)
+    """
+
+    def __init__(self):
+        self.mode = PersistenceMode(PERSISTENCE_MODE) if PERSISTENCE_MODE in (
+            m.value for m in PersistenceMode) else PersistenceMode.ROSTER
+        self._client = None
+        if self.mode == PersistenceMode.VALKEY:
+            if redis is None:
+                raise RuntimeError(
+                    "redis package not installed. Run: pip install redis")
+            self._client = redis.from_url(VALKEY_URL, decode_responses=True)
+            print(f"[persistence] mode=valkey  url={VALKEY_URL}", flush=True)
+        else:
+            print(f"[persistence] mode=roster  path={ROSTER_PATH}", flush=True)
+
+    # -- load -----------------------------------------------------------------
+    def load(self) -> dict | None:
+        """Return the raw roster dict, or None if nothing is stored yet."""
+        if self.mode == PersistenceMode.VALKEY:
+            try:
+                raw = self._client.get(VALKEY_KEY)
+                if raw:
+                    return json.loads(raw)
+            except Exception as exc:
+                print(f"[persistence] valkey load error: {exc}", flush=True)
+            return None
+        else:
+            try:
+                with open(ROSTER_PATH, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except (FileNotFoundError, ValueError, OSError):
+                return None
+
+    # -- save -----------------------------------------------------------------
+    def save(self, data: bytes) -> bool:
+        """Persist serialized roster bytes. Returns True on success."""
+        if self.mode == PersistenceMode.VALKEY:
+            try:
+                self._client.set(VALKEY_KEY, data.decode("utf-8"))
+                return True
+            except Exception as exc:
+                print(f"[persistence] valkey save error: {exc}", flush=True)
+                return False
+        else:
+            return _write_roster_file(data)
+
+
+persistence: PersistenceManager  # assigned after _write_roster_file is defined
 
 TICK_HZ = 30                 # simulation + broadcast rate
 SAVE_EVERY = 5.0             # seconds between roster autosaves when dirty
@@ -562,15 +636,11 @@ class Sim:
 
     # -- persistence --
     def _load(self):
-        try:
-            with open(ROSTER_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                self.rev = int(data.get("rev", 0))
-                for d in data.get("users", []):
-                    self.users.append(self._new_user(d))
-        except (FileNotFoundError, ValueError, OSError):
-            pass
+        raw = persistence.load()
+        if isinstance(raw, dict):
+            self.rev = int(raw.get("rev", 0))
+            for d in raw.get("users", []):
+                self.users.append(self._new_user(d))
 
     def roster_bytes(self):
         """Serialize the persistable roster to bytes (called on the event loop;
@@ -587,8 +657,6 @@ class Sim:
         }
         return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
 
-
-sim = Sim()
 
 
 def _write_roster_file(data: bytes):
@@ -611,14 +679,23 @@ def _write_roster_file(data: bytes):
             time.sleep(0.02)
     return False
 
+# Initialise persistence before Sim so _load can use it.
+# _write_roster_file must be defined first (it's referenced by PersistenceManager.save).
+persistence = PersistenceManager()
+sim = Sim()
+
 
 async def persist_now():
-    """Serialize on the loop, write on a thread. No lock: bytes are a snapshot."""
+    """Serialize on the loop, write via PersistenceManager. No lock: bytes are a snapshot."""
     data = sim.roster_bytes()
     sim.dirty = False
     try:
-        ok = await asyncio.get_running_loop().run_in_executor(
-            None, _write_roster_file, data)
+        if persistence.mode == PersistenceMode.VALKEY:
+            # Valkey set is fast enough to call inline (no thread executor needed)
+            ok = persistence.save(data)
+        else:
+            ok = await asyncio.get_running_loop().run_in_executor(
+                None, persistence.save, data)
         if not ok:
             sim.dirty = True
     except OSError:
@@ -662,8 +739,9 @@ async def sim_loop():
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
     task = asyncio.create_task(sim_loop())
+    backend = f"valkey={VALKEY_URL}" if persistence.mode == PersistenceMode.VALKEY else f"roster={ROSTER_PATH}"
     print(f"space-map (FastAPI/WS) http://{HOST}:{PORT}  "
-          f"(tick {TICK_HZ}Hz, data: {ROSTER_PATH})", flush=True)
+          f"(tick {TICK_HZ}Hz, persistence: {backend})", flush=True)
     try:
         yield
     finally:
@@ -672,7 +750,7 @@ async def lifespan(app: FastAPI):
             await task
         # Best-effort final save so a graceful shutdown doesn't lose the roster.
         if sim.dirty:
-            _write_roster_file(sim.roster_bytes())
+            persistence.save(sim.roster_bytes())
 
 
 app = FastAPI(title="Space Map (authoritative)", lifespan=lifespan)
