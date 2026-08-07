@@ -323,10 +323,16 @@ let currentSession = null; // { id, name, email, token }
 function loadSession() {
   try {
     const raw = localStorage.getItem('space_map_session');
-    if (raw) currentSession = JSON.parse(raw);
-  } catch {
-    currentSession = null;
-  }
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && parsed.id && parsed.token && parsed.name) {
+        currentSession = parsed;
+        return;
+      }
+    }
+  } catch { /* ignore */ }
+  currentSession = null;
+  localStorage.removeItem('space_map_session');
 }
 function saveSession(sess) {
   currentSession = sess;

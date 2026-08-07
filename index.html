@@ -18,19 +18,25 @@
         <div class="login-sub">Enter your email, username, and password to log in or register your star on the live space map.</div>
 
         <div id="session-badge" class="session-badge hidden">
-          <div class="session-info">Logged in as <strong id="session-user-name"></strong></div>
-          <button id="logout-session-btn" class="btn-logout">Log out session</button>
+          <span>Logged in as <strong id="session-user-name"></strong></span>
+          <button id="logout-session-btn" class="btn-logout" type="button">Log out</button>
         </div>
 
         <div id="login-fields">
-          <label class="login-label" for="email">Email</label>
-          <input id="email" type="email" placeholder="you@example.com" autocomplete="email" />
+          <div class="field-group">
+            <label class="login-label" for="email">Email</label>
+            <input id="email" type="email" placeholder="you@example.com" autocomplete="email" />
+          </div>
 
-          <label class="login-label" for="nickname" style="margin-top: 10px;">Username</label>
-          <input id="nickname" type="text" maxlength="16" placeholder="e.g. Nova" autocomplete="username" />
+          <div class="field-group">
+            <label class="login-label" for="nickname">Username</label>
+            <input id="nickname" type="text" maxlength="16" placeholder="e.g. Nova" autocomplete="username" />
+          </div>
 
-          <label class="login-label" for="password" style="margin-top: 10px;">Password</label>
-          <input id="password" type="password" placeholder="••••••••" autocomplete="current-password" />
+          <div class="field-group">
+            <label class="login-label" for="password">Password</label>
+            <input id="password" type="password" placeholder="••••••••" autocomplete="current-password" />
+          </div>
         </div>
 
         <div class="login-actions">

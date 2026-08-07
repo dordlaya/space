@@ -124,53 +124,66 @@ html, body {
   color: var(--hud-dim);
 }
 
+.field-group {
+  margin-bottom: 12px;
+  text-align: left;
+}
+
 .login-label {
   display: block;
-  text-align: left;
   font-size: 11px;
   letter-spacing: 0.12em;
   color: var(--hud-dim);
-  margin-bottom: 6px;
+  margin-bottom: 5px;
 }
 
-#email, #nickname, #password {
+.login-card input {
+  display: block;
   width: 100%;
-  padding: 10px 12px;
+  box-sizing: border-box;
+  padding: 10px 14px;
   font-family: var(--font);
   font-size: 14px;
   color: #eafaff;
-  background: rgba(5, 10, 18, 0.8);
+  background: rgba(5, 10, 18, 0.85);
   border: 1px solid rgba(159, 231, 255, 0.28);
   border-radius: 10px;
   outline: none;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
-#email:focus, #nickname:focus, #password:focus { border-color: rgba(159, 231, 255, 0.7); }
+.login-card input:focus {
+  border-color: rgba(159, 231, 255, 0.7);
+  box-shadow: 0 0 10px rgba(159, 231, 255, 0.15);
+}
 
 .session-badge {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 10px;
   background: rgba(124, 255, 155, 0.08);
-  border: 1px solid rgba(124, 255, 155, 0.3);
+  border: 1px solid rgba(124, 255, 155, 0.35);
   padding: 8px 12px;
   border-radius: 10px;
-  margin-bottom: 14px;
+  margin-bottom: 16px;
   font-size: 12px;
   color: #7CFF9B;
+  text-align: left;
 }
-.session-badge.hidden { display: none; }
+.session-badge.hidden { display: none !important; }
 
 .btn-logout {
-  padding: 4px 8px;
+  padding: 4px 10px;
   font-size: 11px;
   font-family: var(--font);
   color: #ff9b9b;
-  background: rgba(255, 155, 155, 0.12);
-  border: 1px solid rgba(255, 155, 155, 0.3);
+  background: rgba(255, 155, 155, 0.14);
+  border: 1px solid rgba(255, 155, 155, 0.35);
   border-radius: 6px;
   cursor: pointer;
+  white-space: nowrap;
 }
-.btn-logout:hover { background: rgba(255, 155, 155, 0.22); }
+.btn-logout:hover { background: rgba(255, 155, 155, 0.25); }
 
 .login-actions {
   display: flex;
