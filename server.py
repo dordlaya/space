@@ -80,7 +80,7 @@ PORT = int(os.environ.get("PORT", "5173"))
 # ValkeyStore) so a single user's change doesn't rewrite the whole set.
 STORE_BACKEND = os.environ.get("STORE_BACKEND", "json").strip().lower()
 VALKEY_URL = os.environ.get(
-    "VALKEY_URL", "redis://valkey.valkey.svc.cluster.local:6379")
+    "VALKEY_URL", "https://space-k6ye.onrender.com")
 VALKEY_PREFIX = os.environ.get("VALKEY_PREFIX", "spacemap")
 
 TICK_HZ = 30                 # simulation + broadcast rate
