@@ -1,5 +1,3 @@
-# Space Map — server-authoritative edition (FastAPI + WebSockets).
-# uvicorn[standard] pulls in the websockets + httptools + uvloop extras.
 fastapi
 uvicorn[standard]
 redis

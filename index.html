@@ -10,38 +10,47 @@
   <div id="app">
     <canvas id="map"></canvas>
 
-    <!-- Login page: authenticate user; drops a planet on new account (server-authoritative) -->
+    <!-- Top session bar: who you're signed in as + global Log Out -->
+    <div id="session-bar" class="hidden">
+      <span id="session-label" class="session-label"></span>
+      <button id="logout-btn" class="session-logout">Log Out</button>
+    </div>
+
+    <!-- Login page: join a user; each join drops a planet (server-authoritative) -->
     <div id="login" class="hidden">
       <button id="login-close" title="Close">×</button>
       <div class="login-card">
         <div class="login-title">SPACE MAP</div>
-        <div class="login-sub">Enter your email, username, and password to log in or register your star on the live space map.</div>
+        <div class="login-sub">Log in or create an account — your planet lives on the shared map everyone sees live.</div>
 
-        <div id="session-badge" class="session-badge hidden">
-          <span>Logged in as <strong id="session-user-name"></strong></span>
-          <button id="logout-session-btn" class="btn-logout" type="button">Log out</button>
+        <div class="login-tabs">
+          <button id="tab-login" class="login-tab active">Log In</button>
+          <button id="tab-register" class="login-tab">Register</button>
         </div>
 
-        <div id="login-fields">
-          <div class="field-group">
-            <label class="login-label" for="email">Email</label>
-            <input id="email" type="email" placeholder="you@example.com" autocomplete="email" />
-          </div>
-
-          <div class="field-group">
-            <label class="login-label" for="nickname">Username</label>
-            <input id="nickname" type="text" maxlength="16" placeholder="e.g. Nova" autocomplete="username" />
-          </div>
-
-          <div class="field-group">
-            <label class="login-label" for="password">Password</label>
-            <input id="password" type="password" placeholder="••••••••" autocomplete="current-password" />
+        <!-- Log In: email or username + password -->
+        <div id="form-login" class="login-form">
+          <label class="login-label" for="login-id">Email or username</label>
+          <input id="login-id" type="text" maxlength="64" placeholder="you@example.com or Nova" autocomplete="username" />
+          <label class="login-label" for="login-pass">Password</label>
+          <input id="login-pass" type="password" maxlength="64" placeholder="••••••••" autocomplete="current-password" />
+          <div class="login-actions">
+            <button id="login-btn" class="btn-primary">Log in</button>
+            <button id="enter-btn" class="btn-ghost">Enter map</button>
           </div>
         </div>
 
-        <div class="login-actions">
-          <button id="join-btn" class="btn-primary">Log in / Register</button>
-          <button id="enter-btn" class="btn-ghost">Enter map</button>
+        <!-- Register: nickname + email + password (email is not verified) -->
+        <div id="form-register" class="login-form hidden">
+          <label class="login-label" for="reg-name">Nickname</label>
+          <input id="reg-name" type="text" maxlength="16" placeholder="e.g. Nova" autocomplete="off" />
+          <label class="login-label" for="reg-email">Email</label>
+          <input id="reg-email" type="email" maxlength="64" placeholder="you@example.com" autocomplete="off" />
+          <label class="login-label" for="reg-pass">Password</label>
+          <input id="reg-pass" type="password" maxlength="64" placeholder="at least 4 characters" autocomplete="new-password" />
+          <div class="login-actions">
+            <button id="register-btn" class="btn-primary">Create &amp; drop planet</button>
+          </div>
         </div>
 
         <div id="login-error" class="login-error hidden"></div>
@@ -60,8 +69,12 @@
     <!-- Floating button to add more users while playing -->
     <button id="add-user" title="Add user">+ user</button>
 
+    <!-- Heartbeat: self-boost your star's pull force (shown when signed in) -->
+    <button id="heartbeat-btn" class="hidden" title="Heartbeat — boost your pull to 100% for 1 minute">⚡</button>
+
     <!-- Zoom controls -->
     <div id="zoom-controls">
+      <button id="zoom-home" class="hidden" title="Home planet — zoom to your star">🪐</button>
       <button id="zoom-in" title="Zoom in">+</button>
       <button id="zoom-out" title="Zoom out">−</button>
       <button id="zoom-fit" title="Fit map">⊡</button>
@@ -82,11 +95,17 @@
         <span>position</span><span id="si-pos">–</span>
         <span>born</span><span id="si-born">–</span>
       </div>
-      <div class="si-actions">
-        <button id="si-heartbeat" class="si-action-btn hidden">Heartbeat</button>
-        <button id="si-jam" class="si-action-btn hidden">Jam</button>
-      </div>
-      <button id="si-toggle" class="si-toggle">Log out</button>
+      <button id="si-toggle" class="si-toggle">Go Dark</button>
+      <button id="si-jam" class="si-jam hidden">Jam −25%</button>
+    </div>
+
+    <!-- Leaderboard: top 10 stars by size, expandable -->
+    <div id="leaderboard" class="collapsed">
+      <button id="lb-toggle" class="lb-header" title="Show/hide the leaderboard">
+        <span class="lb-title">🏆 Leaderboard</span>
+        <span id="lb-caret" class="lb-caret">▸</span>
+      </button>
+      <div id="lb-body" class="lb-body"></div>
     </div>
 
     <!-- Heads-up display: live simulation stats (from the server) -->
@@ -101,17 +120,7 @@
       <div class="hud-row"><span>link</span><span id="hud-link">–</span></div>
     </div>
 
-    <aside id="leaderboard" class="leaderboard-panel">
-      <div class="leaderboard-title">LEADERBOARD</div>
-      <div id="leaderboard-list" class="leaderboard-list"></div>
-    </aside>
-
-    <button id="map-go-dark" class="map-action-pill hidden">Go Dark</button>
-    <button id="map-logout" class="map-action-pill map-logout-pill hidden">Logout</button>
-    <button id="map-heartbeat" class="map-round-btn heartbeat-btn hidden" title="Heartbeat">♥</button>
-    <button id="map-jam" class="map-round-btn jam-btn hidden" title="Jam selected star">⚡</button>
-
-    <div id="hint">Drag to pan · scroll or use +/− to zoom · click a star to jam it · search to jump.</div>
+    <div id="hint">Drag to pan · scroll or use +/− to zoom · click a star for details · search to jump.</div>
   </div>
 
   <!-- PixiJS v8 (WebGL/WebGPU renderer), global UMD build exposing `PIXI`.
