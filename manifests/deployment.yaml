@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: space-map-server
+  namespace: space
+  labels:
+    app: space-map-server
+spec:
+  # The SERVER holds the single source of truth (one in-memory simulation +
+  # one roster file on a ReadWriteOnce PVC). This MUST stay at 1 replica —
+  # scaling out would give each pod its own separate world.
+  replicas: 1
+  strategy:
+    # RWO volume can't be mounted by two pods at once, so replace, don't roll.
+    type: Recreate
+  selector:
+    matchLabels:
+      app: space-map-server
+  template:
+    metadata:
+      labels:
+        app: space-map-server
+    spec:
+      containers:
+        - name: web
+          image: space-map-server:1.0
+          # Never pull; the image must already be imported into k3s containerd.
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 80
+          env:
+            - name: BIND
+              value: "0.0.0.0"
+            - name: PORT
+              value: "80"
+            - name: DATA_DIR
+              value: "/data"
+            # Persistence backend: "valkey" (default — persists into the Valkey
+            # service below) or "json" (local file on the PVC). With valkey the
+            # /data PVC mount is unused but harmless; flip back to "json" to use it.
+            - name: STORE_BACKEND
+              value: "valkey"
+            - name: VALKEY_URL
+              value: "redis://:"
+          volumeMounts:
+            - name: roster-data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 80
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          resources:
+            # The whole world runs in one Python process on a single thread, so
+            # give it real CPU headroom — throttling here shows up directly as
+            # choppy probe motion for every connected client.
+            requests:
+              cpu: 2000m
+              memory: 2Gi
+            limits:
+              cpu: "4000m"
+              memory: 4Gi
+      volumes:
+        - name: roster-data
+          persistentVolumeClaim:
+            claimName: space-map-server-data

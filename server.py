@@ -20,20 +20,34 @@ Endpoints
                          send messages here (reserved for future viewport input)
   GET  /api/state        one-shot JSON snapshot (debug)
   GET  /api/health       cheap liveness/readiness (no roster serialization)
-  POST /api/join         {"name": "..."}      -> {ok, id} | {ok:false, error}
-  POST /api/login        {"id": N, "value": bool} toggle a star online/offline
+  POST /api/register     {"name","email","password"} -> {ok, id, name} | {ok:false,error}
+  POST /api/login        {"identifier","password"} auth by email OR username -> {ok,id,name}
+  POST /api/status       {"id": N, "value": bool} toggle your star online/offline
+  POST /api/boost        {"id": N}            Heartbeat: self pull -> 100% for 1 min
+  POST /api/jam          {"attacker": A, "target": T}  -25% pull on T for 1 min
   POST /api/reset        clear all users
+
+Auth note: email is NOT verified against any real mail system — only a light
+format check. Passwords are stored salted+hashed (pbkdf2_hmac/sha256).
   (everything else)      static files (index.html, main.js, style.css, ...)
 
 Persistence: roster (name, position, radius, hits, createdAt, loggedIn) is
-written to $DATA_DIR/roster.json. Probes are ephemeral. Single writer -> growth
-is safe to persist (no cross-tab conflicts).
+stored via a pluggable backend selected by STORE_BACKEND:
+  * "json"   (default) — the whole roster as one JSON file at $DATA_DIR/roster.json.
+  * "valkey"           — Valkey-native, under keys prefixed with VALKEY_PREFIX:
+                           {prefix}:user:{id}  HASH   one per user
+                           {prefix}:order      LIST   user ids in insertion order
+                           {prefix}:rev / :seq STRING revision + id counters
+                         Only *changed* users are written each save (per-user
+                         dirty tracking), so one login/collision touches one hash.
+Probes are ephemeral. Single writer -> growth is safe to persist.
 
 Valkey-ready: the broadcast path goes through Hub.publish() and the sim is the
 sole writer. To scale out later, publish snapshots to Valkey (Redis) pub/sub and
 have each replica's WS fan-out subscribe — the Sim stays single-writer.
 
-Env: DATA_DIR (data folder), BIND (host, default 127.0.0.1), PORT (default 5173).
+Env: STORE_BACKEND ("json" | "valkey"), VALKEY_URL, VALKEY_PREFIX, DATA_DIR (data
+folder), BIND (host, default 127.0.0.1), PORT (default 5173).
 """
 import asyncio
 import contextlib
@@ -42,17 +56,9 @@ import json
 import math
 import os
 import random
+import re
 import secrets
 import time
-
-def hash_password(password: str, salt: str = None) -> tuple[str, str]:
-    if not salt:
-        salt = secrets.token_hex(16)
-    pwd_hash = hashlib.pbkdf2_hmac(
-        'sha256', password.encode('utf-8'), salt.encode('utf-8'), 100000
-    ).hex()
-    return pwd_hash, salt
-
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
@@ -67,6 +73,15 @@ ROSTER_PATH = os.path.join(DATA_DIR, "roster.json")
 _default_bind = "0.0.0.0" if os.environ.get("RENDER") else "127.0.0.1"
 HOST = os.environ.get("BIND", _default_bind)
 PORT = int(os.environ.get("PORT", "5173"))
+
+# Persistence backend: "json" (default — local file on $DATA_DIR) or "valkey"
+# (a Redis-compatible server). Flip with STORE_BACKEND=valkey. When valkey, the
+# roster is stored Valkey-natively: one hash per user under VALKEY_PREFIX (see
+# ValkeyStore) so a single user's change doesn't rewrite the whole set.
+STORE_BACKEND = os.environ.get("STORE_BACKEND", "json").strip().lower()
+VALKEY_URL = os.environ.get(
+    "VALKEY_URL", "redis://red-d9pibof10e5c73dg1pe0:6379")
+VALKEY_PREFIX = os.environ.get("VALKEY_PREFIX", "spacemap")
 
 TICK_HZ = 30                 # simulation + broadcast rate
 SAVE_EVERY = 5.0             # seconds between roster autosaves when dirty
@@ -97,6 +112,45 @@ SECTOR_COLS = 4
 SECTOR_PAD = 70.0
 STARS_PER_SECTOR = 10
 PULL_MIN = 0.05
+
+# --- pull-force gameplay ----------------------------------------------------
+# A logged-in star pulls at half strength by default; abilities move it around.
+BASE_PULL = 0.5              # steady-state pull for a logged-in star
+BOOST_PULL = 1.0            # pull while a Heartbeat boost is active
+BOOST_DURATION_MS = 60_000   # Heartbeat lasts 1 minute...
+BOOST_COOLDOWN_MS = 600_000  # ...then the button is locked for the rest of 10 min
+JAM_REDUCTION = 0.25         # each active jam knocks 25% off the target's pull
+JAM_DURATION_MS = 60_000     # a jam bites for 1 minute...
+JAM_COOLDOWN_MS = 1_800_000  # ...and the same attacker can't re-jam it for 30 min
+
+# --- auth (email + password) ------------------------------------------------
+# Email is NOT checked against any real mail system — just a light format test.
+PW_MIN_LEN = 4
+PBKDF2_ITERS = 120_000
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def valid_email(email: str) -> bool:
+    return bool(EMAIL_RE.match((email or "").strip()))
+
+
+def hash_password(password: str) -> str:
+    """Salted PBKDF2-HMAC-SHA256, encoded as algo$iters$salt_hex$hash_hex."""
+    salt = secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ITERS)
+    return f"pbkdf2_sha256${PBKDF2_ITERS}${salt.hex()}${dk.hex()}"
+
+
+def verify_password(password: str, encoded: str) -> bool:
+    try:
+        algo, iters, salt_hex, hash_hex = (encoded or "").split("$")
+        if algo != "pbkdf2_sha256":
+            return False
+        dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"),
+                                 bytes.fromhex(salt_hex), int(iters))
+        return secrets.compare_digest(dk.hex(), hash_hex)
+    except (ValueError, TypeError):
+        return False
 
 # Spatial grid: bucket users into square cells so per-tick physics is O(probes)
 # instead of O(probes x users). The cell must be >= the largest interaction
@@ -152,6 +206,175 @@ class Hub:
 hub = Hub()
 
 
+# --- persistence backends ---------------------------------------------------
+# A store exposes:
+#   load()                       -> {"rev", "users":[record...]} | None
+#   save_full(bytes)             (mode="full")    whole-roster write
+#   save_changes(payload)        (mode="granular") only-changed-users write
+# Every record is {id,name,fx,fy,r,hits,createdAt,loggedIn}. Saves are always
+# called from a thread executor on immutable data, so a slow backend never
+# blocks the event loop or touches live sim state.
+class JsonStore:
+    """Local-file roster store: atomic whole-file write to $DATA_DIR/roster.json."""
+    kind = "json"
+    mode = "full"
+
+    def describe(self):
+        return f"json:{ROSTER_PATH}"
+
+    def load(self):
+        try:
+            with open(ROSTER_PATH, "rb") as f:
+                raw = f.read()
+        except (FileNotFoundError, OSError):
+            return None
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        return {"rev": int(data.get("rev", 0)), "users": data.get("users", [])}
+
+    def save_full(self, data: bytes) -> bool:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        tmp = ROSTER_PATH + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        # os.replace is atomic, but on Windows it can transiently fail with
+        # PermissionError if an AV/indexer holds the target open. Retry a bit.
+        for attempt in range(6):
+            try:
+                os.replace(tmp, ROSTER_PATH)
+                return True
+            except PermissionError:
+                if attempt == 5:
+                    print("warn: roster save deferred (file locked)", flush=True)
+                    return False
+                time.sleep(0.02)
+        return False
+
+
+class ValkeyStore:
+    """Valkey-native roster: one HASH per user + an order LIST + rev/seq keys.
+
+    Keys (all under VALKEY_PREFIX):
+      {prefix}:user:{id}  HASH   name, email, pw, fx, fy, r, hits, createdAt, loggedIn
+      {prefix}:order      LIST   user ids in insertion order (drives sectors)
+      {prefix}:rev        STRING roster revision
+      {prefix}:seq        STRING last user-id counter
+
+    Only changed users are HSET on each save, so a login/collision writes a
+    single hash instead of the whole roster. redis-py is protocol-compatible
+    with Valkey; the client connects lazily, so construction succeeds even when
+    Valkey is briefly unreachable, and load/save degrade gracefully.
+    """
+    kind = "valkey"
+    mode = "granular"
+
+    def __init__(self, url: str, prefix: str):
+        try:
+            import redis  # redis-py is protocol-compatible with Valkey
+        except ImportError as e:
+            raise RuntimeError(
+                "STORE_BACKEND=valkey requires the 'redis' package "
+                "(it's in requirements.txt; run pip install redis)") from e
+        self.url = url
+        self.prefix = prefix
+        self._known = set()   # ids already present in the order LIST
+        # decode_responses -> str in/out; short timeouts so a flaky Valkey
+        # never wedges the save thread.
+        self.client = redis.Redis.from_url(
+            url, decode_responses=True, socket_connect_timeout=3,
+            socket_timeout=3, retry_on_timeout=True, health_check_interval=30)
+
+    # -- key helpers --
+    def _k(self, *parts):
+        return ":".join((self.prefix, *parts))
+
+    def describe(self):
+        return f"valkey:{self.url} prefix={self.prefix}"
+
+    def load(self):
+        try:
+            order = self.client.lrange(self._k("order"), 0, -1)
+            rev = self.client.get(self._k("rev"))
+            seq = self.client.get(self._k("seq"))
+        except Exception as e:  # connection/timeout/etc — start empty, don't die
+            print(f"warn: valkey load failed ({e}); starting with empty roster",
+                  flush=True)
+            return None
+        users = []
+        if order:
+            pipe = self.client.pipeline(transaction=False)
+            for uid in order:
+                pipe.hgetall(self._k("user", uid))
+            for uid, h in zip(order, pipe.execute()):
+                if not h:
+                    continue
+                users.append({
+                    "id": int(uid),
+                    "name": h.get("name", ""),
+                    "fx": float(h.get("fx", 0.0)),
+                    "fy": float(h.get("fy", 0.0)),
+                    "r": float(h.get("r", USER_RADIUS)),
+                    "hits": int(h.get("hits", 0)),
+                    "createdAt": int(h.get("createdAt", 0)),
+                    "loggedIn": h.get("loggedIn") == "1",
+                    "email": h.get("email", ""),
+                    "pw": h.get("pw", ""),
+                })
+                self._known.add(int(uid))
+        return {"rev": int(rev or 0),
+                "seq": int(seq) if seq is not None else 0,
+                "users": users}
+
+    def save_changes(self, payload) -> bool:
+        try:
+            pipe = self.client.pipeline(transaction=False)
+            if payload["reset"]:
+                self._clear()
+                self._known.clear()
+            for rec in payload["users"]:
+                uid = rec["id"]
+                pipe.hset(self._k("user", str(uid)), mapping={
+                    "name": rec["name"], "fx": rec["fx"], "fy": rec["fy"],
+                    "r": rec["r"], "hits": rec["hits"],
+                    "createdAt": rec["createdAt"],
+                    "loggedIn": 1 if rec["loggedIn"] else 0,
+                    "email": rec.get("email", ""), "pw": rec.get("pw", ""),
+                })
+                if uid not in self._known:
+                    # Users are only ever appended (never reordered/individually
+                    # removed), so the order list only grows at the tail.
+                    pipe.rpush(self._k("order"), uid)
+                    self._known.add(uid)
+            pipe.set(self._k("rev"), payload["rev"])
+            pipe.set(self._k("seq"), payload["seq"])
+            pipe.execute()
+            return True
+        except Exception as e:  # caller keeps the changes dirty and retries
+            print(f"warn: valkey save failed ({e}); will retry", flush=True)
+            return False
+
+    def _clear(self):
+        ids = self.client.lrange(self._k("order"), 0, -1)
+        pipe = self.client.pipeline(transaction=False)
+        for uid in ids:
+            pipe.delete(self._k("user", uid))
+        pipe.delete(self._k("order"), self._k("rev"), self._k("seq"))
+        pipe.execute()
+
+
+def _make_store():
+    if STORE_BACKEND == "valkey":
+        return ValkeyStore(VALKEY_URL, VALKEY_PREFIX)
+    return JsonStore()
+
+
+store = _make_store()
+
+
 # --- the authoritative world ------------------------------------------------
 class Sim:
     def __init__(self):
@@ -163,6 +386,11 @@ class Sim:
         self.probe_seq = 0
         self.spawn_timer = SPAWN_MAX
         self.dirty = False
+        # Per-user dirty tracking: ids whose persisted fields changed since the
+        # last save (used by the granular Valkey backend to write only those).
+        # _reset_pending signals the store to clear everything on the next save.
+        self._dirty_users = set()
+        self._reset_pending = False
         # Spatial grid over user positions; rebuilt only when the roster changes
         # (positions are otherwise static — only r/pullForce mutate in place, and
         # the grid stores live references so those are always current).
@@ -254,119 +482,162 @@ class Sim:
     # -- entities --
     def _new_user(self, d):
         logged_in = bool(d.get("loggedIn", False))
-        self.user_seq += 1
+        # Reuse a persisted id when loading; otherwise mint the next one.
+        uid = d.get("id")
+        if uid is None:
+            self.user_seq += 1
+            uid = self.user_seq
+        else:
+            uid = int(uid)
         return {
-            "id": self.user_seq,
-            "name": d.get("name", f"User{self.user_seq}"),
-            "email": d.get("email", ""),
-            "pwd_hash": d.get("pwd_hash", ""),
-            "pwd_salt": d.get("pwd_salt", ""),
-            "token": d.get("token") or secrets.token_hex(32),
+            "id": uid,
+            "name": d.get("name", f"User{uid}"),
             "fx": float(d.get("fx", random.random())),
             "fy": float(d.get("fy", random.random())),
             "r": float(d.get("r", USER_RADIUS)),
             "hits": int(d.get("hits", 0)),
             "createdAt": int(d.get("createdAt", now_ms())),
             "loggedIn": logged_in,
-            "pullForce": 1.0 if logged_in else 0.0,
+            # Credentials: email (login handle, not verified) + hashed password.
+            "email": (d.get("email") or "").strip(),
+            "pw": d.get("pw", ""),
+            "pullForce": BASE_PULL if logged_in else 0.0,
             "pulse": 0.0,
             "x": 0.0, "y": 0.0, "sector": 0,
+            # Transient ability state (not persisted): last Heartbeat activation,
+            # and {attacker_id: activated_at_ms} for jams landed on this star.
+            "boostAt": 0,
+            "jams": {},
         }
 
-    def authenticate_or_create_user(self, name: str, email: str, password: str):
-        """Authenticate an existing user by email + password, or create a new user star."""
-        email_key = email.strip().lower()
-        name_key = name.strip()
-        if not email_key or not password:
-            return {"ok": False, "error": "missing_fields"}
-
-        # Search by email first
-        existing_by_email = next((u for u in self.users if u.get("email", "").strip().lower() == email_key), None)
-
-        if existing_by_email:
-            # Existing account: verify password
-            calc_hash, _ = hash_password(password, existing_by_email.get("pwd_salt", ""))
-            if not secrets.compare_digest(calc_hash, existing_by_email.get("pwd_hash", "")):
-                return {"ok": False, "error": "invalid_credentials"}
-            
-            # Successful authentication
-            if name_key and name_key != existing_by_email["name"]:
-                # Update username if new name provided and not taken by another user
-                if not any(u["name"].strip().lower() == name_key.lower() for u in self.users if u["id"] != existing_by_email["id"]):
-                    existing_by_email["name"] = name_key[:16]
-
-            if not existing_by_email.get("token"):
-                existing_by_email["token"] = secrets.token_hex(32)
-
-            existing_by_email["loggedIn"] = True
-            self.rev += 1
-            self.dirty = True
-            return {
-                "ok": True,
-                "user": {
-                    "id": existing_by_email["id"],
-                    "name": existing_by_email["name"],
-                    "email": existing_by_email["email"],
-                    "token": existing_by_email["token"],
-                }
-            }
-
-        # New account: verify name is available
-        if not name_key:
-            return {"ok": False, "error": "missing_username"}
-
-        if any(u["name"].strip().lower() == name_key.lower() for u in self.users):
+    def register(self, name, email, password):
+        """Create an account + drop its planet. Enforces unique name AND email,
+        a light email-format check, and a minimum password length. Password is
+        stored salted+hashed. Mutation only — the caller persists."""
+        name = (name or "").strip()
+        email = (email or "").strip()
+        key = name.lower()
+        ekey = email.lower()
+        if not key:
+            return {"ok": False, "error": "empty"}
+        if not valid_email(email):
+            return {"ok": False, "error": "bad_email"}
+        if len(password or "") < PW_MIN_LEN:
+            return {"ok": False, "error": "weak_password"}
+        if any(u["name"].strip().lower() == key for u in self.users):
             return {"ok": False, "error": "name_taken"}
-
-        # Create new user star
-        pwd_hash, pwd_salt = hash_password(password)
-        token = secrets.token_hex(32)
+        if any((u.get("email") or "").lower() == ekey for u in self.users):
+            return {"ok": False, "error": "email_taken"}
         sector = len(self.users) // STARS_PER_SECTOR
-        u = self._new_user({
-            "name": name_key[:16],
-            "email": email_key,
-            "pwd_hash": pwd_hash,
-            "pwd_salt": pwd_salt,
-            "token": token,
-            "loggedIn": True,
-            "createdAt": now_ms()
-        })
+        u = self._new_user({"name": name[:16] or None, "email": email,
+                            "pw": hash_password(password),
+                            "loggedIn": True, "createdAt": now_ms()})
         fx, fy = self.place_star_fraction(sector)
         u["fx"], u["fy"] = fx, fy
         self.users.append(u)
         self.position_users()
         self._grid_dirty = True
         self.rev += 1
-        self.dirty = True
-        return {
-            "ok": True,
-            "user": {
-                "id": u["id"],
-                "name": u["name"],
-                "email": u["email"],
-                "token": u["token"],
-            }
-        }
+        self._mark_user_dirty(u["id"])
+        return {"ok": True, "id": u["id"], "name": u["name"]}
 
-    def set_logged_in(self, uid: int, value: bool, token: str = None):
-        """Toggle online/offline status for a star. Requires token authorization."""
+    def authenticate(self, identifier, password):
+        """Log in by email OR username + password; brings the star online.
+        Returns a generic error on any failure so accounts can't be enumerated."""
+        ident = (identifier or "").strip().lower()
+        if not ident:
+            return {"ok": False, "error": "invalid_credentials"}
+        u = next((x for x in self.users
+                  if x["name"].strip().lower() == ident
+                  or (x.get("email") or "").lower() == ident), None)
+        if u is None or not verify_password(password or "", u.get("pw") or ""):
+            return {"ok": False, "error": "invalid_credentials"}
+        if not u["loggedIn"]:
+            u["loggedIn"] = True
+            self.rev += 1
+            self._mark_user_dirty(u["id"])
+        return {"ok": True, "id": u["id"], "name": u["name"]}
+
+    def set_logged_in(self, uid, value):
         for u in self.users:
             if u["id"] == uid:
-                if not token or not u.get("token") or not secrets.compare_digest(u["token"], token):
-                    return {"ok": False, "error": "unauthorized"}
                 u["loggedIn"] = bool(value)
                 self.rev += 1
-                self.dirty = True
+                self._mark_user_dirty(uid)
                 return {"ok": True}
         return {"ok": False, "error": "not_found"}
+
+    # -- abilities (transient, not persisted) --
+    def _active_jams(self, u, now):
+        """Count jams currently biting this star, pruning stale entries."""
+        jams = u.get("jams")
+        if not jams:
+            return 0
+        count = 0
+        for aid, at in list(jams.items()):
+            if now - at >= JAM_COOLDOWN_MS:
+                del jams[aid]                 # cooldown over — forget it entirely
+            elif now - at < JAM_DURATION_MS:
+                count += 1                    # still actively reducing pull
+        return count
+
+    def _pull_target(self, u, now):
+        """The pull force this star is easing toward, given login + abilities."""
+        if not u["loggedIn"]:
+            return 0.0
+        boosting = u["boostAt"] and now - u["boostAt"] < BOOST_DURATION_MS
+        base = BOOST_PULL if boosting else BASE_PULL
+        return max(0.0, base - JAM_REDUCTION * self._active_jams(u, now))
+
+    def activate_boost(self, uid):
+        now = now_ms()
+        for u in self.users:
+            if u["id"] == uid:
+                if not u["loggedIn"]:
+                    return {"ok": False, "error": "offline"}
+                ready_at = u["boostAt"] + BOOST_COOLDOWN_MS if u["boostAt"] else 0
+                if now < ready_at:
+                    return {"ok": False, "error": "cooldown", "readyAt": ready_at}
+                u["boostAt"] = now
+                self.rev += 1                 # push the fresh boostAt to clients now
+                return {"ok": True,
+                        "boostUntil": now + BOOST_DURATION_MS,
+                        "readyAt": now + BOOST_COOLDOWN_MS}
+        return {"ok": False, "error": "not_found"}
+
+    def jam(self, attacker_id, target_id):
+        if attacker_id == target_id:
+            return {"ok": False, "error": "self"}
+        now = now_ms()
+        attacker = next((u for u in self.users if u["id"] == attacker_id), None)
+        target = next((u for u in self.users if u["id"] == target_id), None)
+        if target is None:
+            return {"ok": False, "error": "not_found"}
+        if attacker is None or not attacker["loggedIn"]:
+            return {"ok": False, "error": "offline"}
+        last = target["jams"].get(attacker_id)
+        if last is not None and now - last < JAM_COOLDOWN_MS:
+            return {"ok": False, "error": "cooldown",
+                    "cooldownUntil": last + JAM_COOLDOWN_MS}
+        target["jams"][attacker_id] = now
+        self.rev += 1                         # reflect the reduced pull promptly
+        return {"ok": True,
+                "jamUntil": now + JAM_DURATION_MS,
+                "cooldownUntil": now + JAM_COOLDOWN_MS}
 
     def reset(self):
         self.users = []
         self.probes = []
         self._grid_dirty = True
         self.rev += 1
+        self._dirty_users.clear()
+        self._reset_pending = True
         self.dirty = True
         return {"ok": True}
+
+    def _mark_user_dirty(self, uid):
+        self._dirty_users.add(uid)
+        self.dirty = True
 
     def active_users(self):
         return sum(1 for u in self.users if u["loggedIn"])
@@ -445,9 +716,10 @@ class Sim:
             self.spawn_timer = self.spawn_interval()
 
         ease = min(1.0, dt * PULL_FADE)
+        now = now_ms()
         any_active = False
         for u in self.users:
-            target = 1.0 if u["loggedIn"] else 0.0
+            target = self._pull_target(u, now)
             u["pullForce"] += (target - u["pullForce"]) * ease
             if u["pullForce"] > PULL_MIN:
                 any_active = True
@@ -518,7 +790,7 @@ class Sim:
                 if new_r > hit["r"]:
                     hit["r"] = new_r
                 self.collisions += 1
-                self.dirty = True
+                self._mark_user_dirty(hit["id"])
                 del self.probes[i]
 
     # -- snapshot --
@@ -550,7 +822,7 @@ class Sim:
                 "r": round(u["r"], 2), "hits": u["hits"],
                 "loggedIn": u["loggedIn"], "pull": round(u["pullForce"], 3),
                 "pulse": round(u["pulse"], 3), "createdAt": u["createdAt"],
-                "sector": u["sector"],
+                "sector": u["sector"], "boostAt": u["boostAt"],
             } for u in self.users]
         return snap
 
@@ -561,68 +833,92 @@ class Sim:
         return json.dumps(snap, separators=(",", ":")), self.rev
 
     # -- persistence --
+    @staticmethod
+    def _persist_record(u):
+        """The subset of a user that gets persisted (a plain, copyable dict)."""
+        return {
+            "id": u["id"], "name": u["name"], "fx": u["fx"], "fy": u["fy"],
+            "r": u["r"], "hits": u["hits"], "createdAt": u["createdAt"],
+            "loggedIn": u["loggedIn"],
+            "email": u.get("email", ""), "pw": u.get("pw", ""),
+        }
+
     def _load(self):
-        try:
-            with open(ROSTER_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                self.rev = int(data.get("rev", 0))
-                for d in data.get("users", []):
-                    self.users.append(self._new_user(d))
-        except (FileNotFoundError, ValueError, OSError):
-            pass
+        snap = store.load()
+        if not snap:
+            return
+        self.rev = int(snap.get("rev", 0))
+        max_id = 0
+        for d in snap.get("users", []):
+            u = self._new_user(d)
+            self.users.append(u)
+            max_id = max(max_id, u["id"])
+        # Never re-issue an id that already exists on disk / in Valkey.
+        self.user_seq = max(self.user_seq, int(snap.get("seq", 0)), max_id)
 
     def roster_bytes(self):
-        """Serialize the persistable roster to bytes (called on the event loop;
-        the resulting bytes are what gets handed to the writer thread)."""
+        """Serialize the whole persistable roster to bytes (JSON backend). Called
+        on the event loop; the bytes are what gets handed to the writer thread."""
         payload = {
             "rev": self.rev,
-            "users": [{
-                "name": u["name"], "email": u.get("email", ""),
-                "pwd_hash": u.get("pwd_hash", ""), "pwd_salt": u.get("pwd_salt", ""),
-                "token": u.get("token", ""),
-                "fx": u["fx"], "fy": u["fy"], "r": u["r"],
-                "hits": u["hits"], "createdAt": u["createdAt"], "loggedIn": u["loggedIn"],
-            } for u in self.users],
+            "users": [self._persist_record(u) for u in self.users],
         }
         return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+
+    def drain_changes(self):
+        """Snapshot the pending changes for the granular (Valkey) backend and
+        clear the dirty state. Called on the event loop so it's race-free."""
+        reset = self._reset_pending
+        users = []
+        if not reset:
+            by_id = {u["id"]: u for u in self.users}
+            for uid in self._dirty_users:
+                u = by_id.get(uid)
+                if u is not None:
+                    users.append(self._persist_record(u))
+        payload = {"rev": self.rev, "seq": self.user_seq,
+                   "reset": reset, "users": users}
+        self._dirty_users = set()
+        self._reset_pending = False
+        self.dirty = False
+        return payload
+
+    def requeue_changes(self, payload):
+        """Re-mark a failed granular save so the next autosave retries it."""
+        if payload.get("reset"):
+            self._reset_pending = True
+        for rec in payload.get("users", []):
+            self._dirty_users.add(rec["id"])
+        self.dirty = True
 
 
 sim = Sim()
 
 
-def _write_roster_file(data: bytes):
-    """Atomically write pre-serialized roster bytes. Runs in a thread executor,
-    so it must NOT touch live sim state — only the bytes it was handed."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    tmp = ROSTER_PATH + ".tmp"
-    with open(tmp, "wb") as f:
-        f.write(data)
-    # os.replace is atomic, but on Windows it can transiently fail with
-    # PermissionError if an AV/indexer holds the target open. Retry a few times.
-    for attempt in range(6):
-        try:
-            os.replace(tmp, ROSTER_PATH)
-            return True
-        except PermissionError:
-            if attempt == 5:
-                print("warn: roster save deferred (file locked)", flush=True)
-                return False
-            time.sleep(0.02)
-    return False
-
-
 async def persist_now():
-    """Serialize on the loop, write on a thread. No lock: bytes are a snapshot."""
-    data = sim.roster_bytes()
-    sim.dirty = False
-    try:
-        ok = await asyncio.get_running_loop().run_in_executor(
-            None, _write_roster_file, data)
-        if not ok:
-            sim.dirty = True
-    except OSError:
-        sim.dirty = True  # try again on the next autosave
+    """Snapshot on the loop, write via the store on a thread. No lock: the data
+    handed to the writer thread is an immutable copy, so it never touches live
+    state. JSON writes the whole roster; Valkey writes only changed users."""
+    loop = asyncio.get_running_loop()
+    if store.mode == "granular":
+        payload = sim.drain_changes()
+        try:
+            ok = await loop.run_in_executor(None, store.save_changes, payload)
+            if not ok:
+                sim.requeue_changes(payload)
+        except Exception:
+            sim.requeue_changes(payload)  # retry on the next autosave
+    else:
+        data = sim.roster_bytes()
+        sim.dirty = False
+        sim._dirty_users.clear()
+        sim._reset_pending = False
+        try:
+            ok = await loop.run_in_executor(None, store.save_full, data)
+            if not ok:
+                sim.dirty = True
+        except Exception:
+            sim.dirty = True  # try again on the next autosave
 
 
 # --- simulation task (single event loop, no locks) --------------------------
@@ -663,7 +959,7 @@ async def sim_loop():
 async def lifespan(app: FastAPI):
     task = asyncio.create_task(sim_loop())
     print(f"space-map (FastAPI/WS) http://{HOST}:{PORT}  "
-          f"(tick {TICK_HZ}Hz, data: {ROSTER_PATH})", flush=True)
+          f"(tick {TICK_HZ}Hz, store: {store.describe()})", flush=True)
     try:
         yield
     finally:
@@ -672,22 +968,38 @@ async def lifespan(app: FastAPI):
             await task
         # Best-effort final save so a graceful shutdown doesn't lose the roster.
         if sim.dirty:
-            _write_roster_file(sim.roster_bytes())
+            if store.mode == "granular":
+                store.save_changes(sim.drain_changes())
+            else:
+                store.save_full(sim.roster_bytes())
 
 
 app = FastAPI(title="Space Map (authoritative)", lifespan=lifespan)
 
 
-class AuthReq(BaseModel):
-    email: str = ""
+class RegisterReq(BaseModel):
     name: str = ""
+    email: str = ""
     password: str = ""
 
 
 class LoginReq(BaseModel):
+    identifier: str = ""    # email OR username
+    password: str = ""
+
+
+class StatusReq(BaseModel):
     id: int
     value: bool = True
-    token: str = ""
+
+
+class BoostReq(BaseModel):
+    id: int
+
+
+class JamReq(BaseModel):
+    attacker: int
+    target: int
 
 
 @app.get("/api/health")
@@ -695,7 +1007,7 @@ async def api_health():
     # Deliberately cheap — no roster serialization — so probes stay light even
     # with thousands of users.
     return {"ok": True, "users": len(sim.users), "probes": len(sim.probes),
-            "rev": sim.rev}
+            "rev": sim.rev, "store": store.kind}
 
 
 @app.get("/api/state")
@@ -703,27 +1015,43 @@ async def api_state():
     return JSONResponse(sim.snapshot(include_users=True))
 
 
-@app.post("/api/auth")
-@app.post("/api/join")
-async def api_auth(req: AuthReq):
-    res = sim.authenticate_or_create_user(req.name, req.email, req.password)
+@app.post("/api/register")
+async def api_register(req: RegisterReq):
+    res = sim.register(req.name, req.email, req.password)
     if res.get("ok"):
         await persist_now()
-        return JSONResponse(res, status_code=200)
-    err = res.get("error")
-    status_code = 401 if err == "invalid_credentials" else 400
-    return JSONResponse(res, status_code=status_code)
+    return JSONResponse(res, status_code=200 if res.get("ok") else 400)
 
 
 @app.post("/api/login")
 async def api_login(req: LoginReq):
-    res = sim.set_logged_in(req.id, req.value, req.token)
+    res = sim.authenticate(req.identifier, req.password)
     if res.get("ok"):
         await persist_now()
-        return JSONResponse(res, status_code=200)
-    err = res.get("error")
-    status_code = 403 if err == "unauthorized" else 404
-    return JSONResponse(res, status_code=status_code)
+    return JSONResponse(res, status_code=200 if res.get("ok") else 401)
+
+
+@app.post("/api/status")
+async def api_status(req: StatusReq):
+    # Toggle your own star online/offline (Go Live / Go Dark). No password —
+    # this is a session action on an already-authenticated star.
+    res = sim.set_logged_in(req.id, req.value)
+    if res.get("ok"):
+        await persist_now()
+    return JSONResponse(res, status_code=200 if res.get("ok") else 404)
+
+
+@app.post("/api/boost")
+async def api_boost(req: BoostReq):
+    # Ability state is transient — no persistence needed.
+    res = sim.activate_boost(req.id)
+    return JSONResponse(res, status_code=200 if res.get("ok") else 409)
+
+
+@app.post("/api/jam")
+async def api_jam(req: JamReq):
+    res = sim.jam(req.attacker, req.target)
+    return JSONResponse(res, status_code=200 if res.get("ok") else 409)
 
 
 @app.post("/api/reset")

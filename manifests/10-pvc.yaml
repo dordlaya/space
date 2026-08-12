@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: space-map-server-data
+  namespace: space
+  labels:
+    app: space-map-server
+spec:
+  accessModes:
+    - ReadWriteOnce
+  # k3s ships the "local-path" StorageClass as the default; leaving
+  # storageClassName unset uses it. Set it explicitly if your cluster differs.
+  resources:
+    requests:
+      storage: 128Mi

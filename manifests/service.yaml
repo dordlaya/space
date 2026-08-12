@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: space-map-server
+  namespace: space
+  labels:
+    app: space-map-server
+spec:
+  # NodePort gives you a fixed, dedicated port on the k3s node.
+  type: NodePort
+  selector:
+    app: space-map-server
+  ports:
+    - name: http
+      port: 80          # in-cluster service port
+      targetPort: 80    # container port (server.py, binds 0.0.0.0:80)
+      nodePort: 30081   # dedicated external port -> http://<node-ip>:30081

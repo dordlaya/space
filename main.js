@@ -241,6 +241,19 @@ let selectedUserId = null;
 let firstSnapshot = false;
 let linkUp = false;
 
+// The signed-in session: which star is "mine". Persisted in localStorage so a
+// reload keeps you signed in, and it gates edits to your own star only.
+const SESSION_KEY = 'spacemap.session';
+let sessionUserId = null;
+let sessionUserName = null;
+
+// Ability timings — mirror the server so the UI can show live countdowns.
+// The server stays the sole authority; these are for display only.
+const BOOST_DURATION_MS = 60_000;      // Heartbeat: 100% pull for 1 min...
+const BOOST_COOLDOWN_MS = 600_000;     // ...then locked for the rest of 10 min
+// Per-target jam cooldown expiry (ms epoch) from the server, keyed by target id.
+const jamCooldowns = new Map();
+
 function getUserById(id) { return users.find((u) => u.id === id) || null; }
 
 // Merge a server snapshot into local state.
@@ -257,7 +270,7 @@ function applySnapshot(snap) {
     users = snap.users.map((s) => ({
       id: s.id, name: s.name, x: s.x, y: s.y, r: s.r, hits: s.hits,
       loggedIn: s.loggedIn, pullForce: s.pull, pulse: s.pulse,
-      createdAt: s.createdAt, sector: s.sector,
+      createdAt: s.createdAt, sector: s.sector, boostAt: s.boostAt || 0,
     }));
   }
 
@@ -282,6 +295,7 @@ function applySnapshot(snap) {
   // refresh dependent UI.
   if (hasUsers && snap.rev !== serverRev) {
     serverRev = snap.rev;
+    validateSession();   // drop a stale session (e.g. after a reset)
     refreshLoginUI();
     if (selectedUserId !== null && !getUserById(selectedUserId)) {
       selectedUserId = null;
@@ -316,57 +330,55 @@ function scheduleReconnect() {
 connectStream();
 
 // ---------------------------------------------------------------------------
-// Session state (stored in localStorage)
-// ---------------------------------------------------------------------------
-let currentSession = null; // { id, name, email, token }
-
-function loadSession() {
-  try {
-    const raw = localStorage.getItem('space_map_session');
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      if (parsed && parsed.id && parsed.token && parsed.name) {
-        currentSession = parsed;
-        return;
-      }
-    }
-  } catch { /* ignore */ }
-  currentSession = null;
-  localStorage.removeItem('space_map_session');
-}
-function saveSession(sess) {
-  currentSession = sess;
-  if (sess) {
-    localStorage.setItem('space_map_session', JSON.stringify(sess));
-  } else {
-    localStorage.removeItem('space_map_session');
-  }
-}
-loadSession();
-
-// ---------------------------------------------------------------------------
 // Server actions (client input -> authoritative server)
 // ---------------------------------------------------------------------------
-async function apiAuth(email, name, password) {
-  const res = await fetch('/api/auth', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email, name, password }),
-  });
-  return res.json();
-}
-async function apiLogin(id, value) {
-  if (!currentSession || currentSession.id !== id) {
-    return; // UI protection: only owner can toggle their own star
-  }
+async function apiRegister(name, email, password) {
   try {
-    await fetch('/api/login', {
+    const res = await fetch('/api/register', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id, value, token: currentSession.token }),
+      body: JSON.stringify({ name, email, password }),
+    });
+    return res.json();
+  } catch { return { ok: false, error: 'network' }; }
+}
+async function apiLogin(identifier, password) {
+  try {
+    const res = await fetch('/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ identifier, password }),
+    });
+    return res.json();
+  } catch { return { ok: false, error: 'network' }; }
+}
+// Toggle your own star online/offline (Go Live / Go Dark) — no password.
+async function apiStatus(id, value) {
+  try {
+    await fetch('/api/status', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, value }),
     });
   } catch { /* will resync on next snapshot */ }
 }
 async function apiReset() {
   try { await fetch('/api/reset', { method: 'POST' }); } catch { /* ignore */ }
+}
+async function apiBoost(id) {
+  try {
+    const r = await fetch('/api/boost', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id }),
+    });
+    return r.json();
+  } catch { return { ok: false, error: 'network' }; }
+}
+async function apiJam(attacker, target) {
+  try {
+    const r = await fetch('/api/jam', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ attacker, target }),
+    });
+    return r.json();
+  } catch { return { ok: false, error: 'network' }; }
 }
 
 // ---------------------------------------------------------------------------
@@ -732,6 +744,9 @@ function updateHud(dt, fps) {
   hud.link.textContent = linkUp ? 'live' : 'reconnecting…';
   hud.link.className = linkUp ? 'link-live' : 'link-down';
   updateStarInfo();
+  refreshHeartbeat();
+  refreshHomeButton();
+  refreshLeaderboard();
 }
 
 // ---------------------------------------------------------------------------
@@ -743,6 +758,17 @@ function zoomBy(factor) {
 document.getElementById('zoom-in').addEventListener('click', () => zoomBy(CONFIG.zoomStep));
 document.getElementById('zoom-out').addEventListener('click', () => zoomBy(1 / CONFIG.zoomStep));
 document.getElementById('zoom-fit').addEventListener('click', fitView);
+
+// Home planet: zoom straight to your own star (only shown when signed in).
+const homeBtn = document.getElementById('zoom-home');
+homeBtn.addEventListener('click', () => {
+  const me = sessionUserId !== null ? getUserById(sessionUserId) : null;
+  if (me) focusStar(me);
+});
+function refreshHomeButton() {
+  const has = sessionUserId !== null && !!getUserById(sessionUserId);
+  homeBtn.classList.toggle('hidden', !has);
+}
 
 // ---------------------------------------------------------------------------
 // Search — jump to a star (by name) or a sector (by name).
@@ -819,18 +845,69 @@ document.addEventListener('pointerdown', (e) => {
 });
 
 // ---------------------------------------------------------------------------
+// Leaderboard — top 10 stars by size; expand/collapse, state remembered.
+// ---------------------------------------------------------------------------
+const LB_KEY = 'spacemap.lb';
+const leaderboard = {
+  panel: document.getElementById('leaderboard'),
+  toggle: document.getElementById('lb-toggle'),
+  body: document.getElementById('lb-body'),
+};
+let lbOpen = false;
+try { lbOpen = localStorage.getItem(LB_KEY) === '1'; } catch { /* ignore */ }
+
+function setLeaderboardOpen(open) {
+  lbOpen = open;
+  leaderboard.panel.classList.toggle('collapsed', !open);
+  try { localStorage.setItem(LB_KEY, open ? '1' : '0'); } catch { /* ignore */ }
+  if (open) refreshLeaderboard();
+}
+
+function refreshLeaderboard() {
+  if (!lbOpen) return;   // hidden — don't bother building rows
+  const top = [...users].sort((a, b) => b.r - a.r).slice(0, 10);
+  if (!top.length) {
+    leaderboard.body.innerHTML = '<div class="lb-empty">No stars yet.</div>';
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  top.forEach((u, i) => {
+    const row = document.createElement('div');
+    row.className = 'lb-row';
+    row.title = `Focus ${u.name}`;
+    // Build via nodes + textContent so user-supplied names can't inject markup.
+    row.innerHTML =
+      `<span class="lb-rank">${i + 1}</span>` +
+      '<div class="lb-main"><span class="lb-name"></span><span class="lb-sector"></span></div>' +
+      `<span class="lb-size">${u.r.toFixed(1)}px</span>` +
+      `<span class="lb-dot ${u.loggedIn ? 'online' : ''}" title="${u.loggedIn ? 'online' : 'offline'}"></span>`;
+    row.querySelector('.lb-name').textContent = u.name;
+    row.querySelector('.lb-sector').textContent = sectorName(u.sector);
+    row.addEventListener('click', () => focusStar(u));
+    frag.appendChild(row);
+  });
+  leaderboard.body.replaceChildren(frag);
+}
+
+leaderboard.toggle.addEventListener('click', () => setLeaderboardOpen(!lbOpen));
+setLeaderboardOpen(lbOpen);
+
 // ---------------------------------------------------------------------------
 // Login page — actions now go to the authoritative server.
 // ---------------------------------------------------------------------------
 const login = {
   panel: document.getElementById('login'),
-  email: document.getElementById('email'),
-  nickname: document.getElementById('nickname'),
-  password: document.getElementById('password'),
-  sessionBadge: document.getElementById('session-badge'),
-  sessionUserName: document.getElementById('session-user-name'),
-  logoutSessionBtn: document.getElementById('logout-session-btn'),
-  join: document.getElementById('join-btn'),
+  tabLogin: document.getElementById('tab-login'),
+  tabRegister: document.getElementById('tab-register'),
+  formLogin: document.getElementById('form-login'),
+  formRegister: document.getElementById('form-register'),
+  loginId: document.getElementById('login-id'),
+  loginPass: document.getElementById('login-pass'),
+  loginBtn: document.getElementById('login-btn'),
+  regName: document.getElementById('reg-name'),
+  regEmail: document.getElementById('reg-email'),
+  regPass: document.getElementById('reg-pass'),
+  registerBtn: document.getElementById('register-btn'),
   enter: document.getElementById('enter-btn'),
   list: document.getElementById('user-list'),
   reset: document.getElementById('reset-users'),
@@ -839,20 +916,33 @@ const login = {
   error: document.getElementById('login-error'),
 };
 
+let loginMode = 'login';
+function setLoginMode(mode) {
+  loginMode = mode;
+  const isLogin = mode === 'login';
+  login.tabLogin.classList.toggle('active', isLogin);
+  login.tabRegister.classList.toggle('active', !isLogin);
+  login.formLogin.classList.toggle('hidden', !isLogin);
+  login.formRegister.classList.toggle('hidden', isLogin);
+  clearLoginError();
+}
+
 function showLogin() {
   login.panel.classList.remove('hidden');
   clearLoginError();
   refreshLoginUI();
-  setTimeout(() => {
-    if (currentSession) {
-      login.email.focus();
-    } else {
-      login.email.focus();
-    }
-  }, 50);
+  const focusEl = loginMode === 'login' ? login.loginId : login.regName;
+  setTimeout(() => focusEl.focus(), 50);
 }
 function hideLogin() { login.panel.classList.add('hidden'); }
 
+function emailLooksValid(email) {
+  return /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test((email || '').trim());
+}
+function userExists(name) {
+  const key = name.trim().toLowerCase();
+  return !!key && users.some((u) => u.name.toLowerCase() === key);
+}
 function showLoginError(msg) {
   login.error.textContent = msg;
   login.error.classList.remove('hidden');
@@ -861,20 +951,23 @@ function clearLoginError() {
   login.error.textContent = '';
   login.error.classList.add('hidden');
 }
+function errorMessage(error) {
+  switch (error) {
+    case 'name_taken': return 'That nickname is already taken — pick another.';
+    case 'email_taken': return 'That email is already registered — try logging in.';
+    case 'bad_email': return 'Please enter a valid email address.';
+    case 'weak_password': return 'Password must be at least 4 characters.';
+    case 'empty': return 'Please enter a nickname.';
+    case 'invalid_credentials': return 'Wrong email/username or password.';
+    case 'network': return 'Server unreachable — please try again.';
+    default: return 'Something went wrong — please try again.';
+  }
+}
 
 const USER_LIST_LIMIT = 10;   // show the N most-recent users; rest behind a toggle
 let showAllUsers = false;
 
 function refreshLoginUI() {
-  if (currentSession) {
-    login.sessionBadge.classList.remove('hidden');
-    login.sessionUserName.textContent = currentSession.name;
-    login.email.value = currentSession.email || '';
-    login.nickname.value = currentSession.name || '';
-  } else {
-    login.sessionBadge.classList.add('hidden');
-  }
-
   login.list.innerHTML = '';
 
   // Most-recently-joined first, so the "latest" users are always visible.
@@ -882,17 +975,14 @@ function refreshLoginUI() {
   const shown = showAllUsers ? ordered : ordered.slice(0, USER_LIST_LIMIT);
 
   for (const u of shown) {
-    const isSelf = currentSession && u.id === currentSession.id;
     const chip = document.createElement('span');
-    chip.className = 'user-chip' + (u.loggedIn ? ' online' : '');
-    chip.textContent = u.name + (isSelf ? ' (you)' : '');
-    if (isSelf) {
-      chip.title = u.loggedIn ? 'Your star (Online) — click to log out' : 'Your star (Offline) — click to log in';
-      chip.addEventListener('click', () => { apiLogin(u.id, !u.loggedIn); });
-    } else {
-      chip.title = `Star ${u.name} — click to view on map`;
-      chip.addEventListener('click', () => { focusStar(u); hideLogin(); });
-    }
+    chip.className = 'user-chip' + (u.loggedIn ? ' online' : '')
+      + (u.id === sessionUserId ? ' me' : '');
+    chip.textContent = u.name;
+    chip.title = u.id === sessionUserId
+      ? "This is you — you're signed in"
+      : `Log in as ${u.name}`;
+    chip.addEventListener('click', () => { loginAs(u); });
     login.list.appendChild(chip);
   }
 
@@ -906,76 +996,143 @@ function refreshLoginUI() {
     login.list.appendChild(more);
   }
 
-  login.enter.style.display = users.length ? 'inline-block' : 'none';
   login.close.style.display = 'flex';
   login.addBtn.style.display = 'flex';
 }
 
-async function doAuth() {
-  const email = login.email.value.trim();
-  const name = login.nickname.value.trim();
-  const password = login.password.value;
-
-  if (!email) { showLoginError('Please enter an email.'); login.email.focus(); return; }
-  if (!password) { showLoginError('Please enter a password.'); login.password.focus(); return; }
-
-  login.join.disabled = true;
+async function doLogin() {
+  const identifier = login.loginId.value.trim();
+  const password = login.loginPass.value;
+  if (!identifier || !password) {
+    showLoginError('Enter your email/username and password.');
+    return;
+  }
+  login.loginBtn.disabled = true;
   try {
-    const res = await apiAuth(email, name, password);
-    if (!res.ok) {
-      let msg = 'Could not log in — please try again.';
-      if (res.error === 'invalid_credentials') {
-        msg = 'Invalid email or password.';
-        login.password.select();
-      } else if (res.error === 'missing_username') {
-        msg = 'Username is required to register a new star.';
-        login.nickname.focus();
-      } else if (res.error === 'name_taken') {
-        msg = `"${name}" is taken by another star — choose a different username.`;
-        login.nickname.select();
-      }
-      showLoginError(msg);
-      return;
-    }
+    const res = await apiLogin(identifier, password);
+    if (!res.ok) { showLoginError(errorMessage(res.error)); login.loginPass.select(); return; }
     clearLoginError();
-    saveSession(res.user);
-    login.password.value = '';
-    fitPending = true;      // fit once the user star shows up in a snapshot
+    setSession(res.id, res.name);
+    login.loginPass.value = '';
+    fitPending = true;      // fit once our star shows up in a snapshot
     hideLogin();
-  } catch {
-    showLoginError('Server unreachable — please try again.');
   } finally {
-    login.join.disabled = false;
+    login.loginBtn.disabled = false;
   }
 }
 
-function logoutSession() {
-  saveSession(null);
-  login.password.value = '';
-  refreshLoginUI();
-  clearLoginError();
+async function doRegister() {
+  const name = login.regName.value.trim();
+  const email = login.regEmail.value.trim();
+  const password = login.regPass.value;
+  if (!name) { showLoginError('Please enter a nickname.'); login.regName.focus(); return; }
+  if (!emailLooksValid(email)) { showLoginError('Please enter a valid email address.'); login.regEmail.focus(); return; }
+  if (password.length < 4) { showLoginError('Password must be at least 4 characters.'); login.regPass.focus(); return; }
+  // Fast client-side name check for snappy feedback; the server is authoritative.
+  if (userExists(name)) { showLoginError('That nickname is already taken — pick another.'); login.regName.select(); return; }
+  login.registerBtn.disabled = true;
+  try {
+    const res = await apiRegister(name, email, password);
+    if (!res.ok) { showLoginError(errorMessage(res.error)); return; }
+    clearLoginError();
+    setSession(res.id, res.name || name);   // this new star is now "mine"
+    login.regName.value = ''; login.regEmail.value = ''; login.regPass.value = '';
+    fitPending = true;
+    hideLogin();
+  } finally {
+    login.registerBtn.disabled = false;
+  }
 }
 
-login.join.addEventListener('click', doAuth);
-login.password.addEventListener('keydown', (e) => { if (e.key === 'Enter') doAuth(); });
-login.nickname.addEventListener('keydown', (e) => { if (e.key === 'Enter') doAuth(); });
-login.email.addEventListener('keydown', (e) => { if (e.key === 'Enter') doAuth(); });
-login.email.addEventListener('input', clearLoginError);
-login.nickname.addEventListener('input', clearLoginError);
-login.password.addEventListener('input', clearLoginError);
-login.logoutSessionBtn.addEventListener('click', logoutSession);
+login.tabLogin.addEventListener('click', () => setLoginMode('login'));
+login.tabRegister.addEventListener('click', () => setLoginMode('register'));
+login.loginBtn.addEventListener('click', doLogin);
+login.registerBtn.addEventListener('click', doRegister);
+[login.loginId, login.loginPass].forEach((el) =>
+  el.addEventListener('keydown', (e) => { if (e.key === 'Enter') doLogin(); }));
+[login.regName, login.regEmail, login.regPass].forEach((el) =>
+  el.addEventListener('keydown', (e) => { if (e.key === 'Enter') doRegister(); }));
+[login.loginId, login.loginPass, login.regName, login.regEmail, login.regPass]
+  .forEach((el) => el.addEventListener('input', clearLoginError));
 login.enter.addEventListener('click', () => { hideLogin(); fitView(); });
 login.close.addEventListener('click', hideLogin);
 login.addBtn.addEventListener('click', showLogin);
 login.reset.addEventListener('click', (e) => {
   e.preventDefault();
   apiReset();
-  saveSession(null);
+  clearSession();
   selectedUserId = null;
   hideStarInfo();
 });
+setLoginMode('login');
 
-showLogin();
+// ---------------------------------------------------------------------------
+// Session — remember who "I" am across reloads, and gate edits to my own star.
+// ---------------------------------------------------------------------------
+const sessionBar = {
+  bar: document.getElementById('session-bar'),
+  label: document.getElementById('session-label'),
+  logout: document.getElementById('logout-btn'),
+};
+
+function loadSession() {
+  try {
+    const s = JSON.parse(localStorage.getItem(SESSION_KEY));
+    if (s && typeof s.id === 'number') return s;
+  } catch { /* ignore corrupt value */ }
+  return null;
+}
+function setSession(id, name) {
+  sessionUserId = id;
+  sessionUserName = name;
+  try { localStorage.setItem(SESSION_KEY, JSON.stringify({ id, name })); } catch { /* ignore */ }
+  refreshSessionBar();
+  refreshHeartbeat();
+  if (selectedUserId !== null) updateStarInfo();
+}
+function clearSession() {
+  sessionUserId = null;
+  sessionUserName = null;
+  try { localStorage.removeItem(SESSION_KEY); } catch { /* ignore */ }
+  refreshSessionBar();
+  refreshHeartbeat();
+  if (selectedUserId !== null) updateStarInfo();
+}
+// Drop the session if the star it points at no longer matches (e.g. reset).
+function validateSession() {
+  if (sessionUserId === null) return;
+  const me = getUserById(sessionUserId);
+  const nameOk = me && (!sessionUserName
+    || me.name.toLowerCase() === sessionUserName.toLowerCase());
+  if (!nameOk) clearSession();
+}
+// Clicking a known user prefills the login form (password still required).
+function loginAs(u) {
+  setLoginMode('login');
+  login.loginId.value = u.name;
+  login.loginPass.value = '';
+  clearLoginError();
+  setTimeout(() => login.loginPass.focus(), 30);
+}
+function refreshSessionBar() {
+  if (sessionUserId !== null) {
+    sessionBar.label.textContent = `Signed in as ${sessionUserName || '—'}`;
+    sessionBar.bar.classList.remove('hidden');
+  } else {
+    sessionBar.bar.classList.add('hidden');
+  }
+}
+sessionBar.logout.addEventListener('click', clearSession);
+
+// Bootstrap: resume a saved session straight onto the map; otherwise show login.
+const savedSession = loadSession();
+if (savedSession) {
+  sessionUserId = savedSession.id;
+  sessionUserName = savedSession.name;
+  refreshSessionBar();
+} else {
+  showLogin();
+}
 
 // ---------------------------------------------------------------------------
 // Star info panel
@@ -993,15 +1150,23 @@ const starInfo = {
   pos: document.getElementById('si-pos'),
   born: document.getElementById('si-born'),
   toggle: document.getElementById('si-toggle'),
+  jam: document.getElementById('si-jam'),
   close: document.getElementById('si-close'),
 };
 starInfo.close.addEventListener('click', () => { selectedUserId = null; hideStarInfo(); });
 starInfo.toggle.addEventListener('click', () => {
+  if (selectedUserId !== sessionUserId) return;   // you can only change your own star
   const u = getUserById(selectedUserId);
   if (!u) return;
-  if (currentSession && u.id === currentSession.id) {
-    apiLogin(u.id, !u.loggedIn);   // server flips it; snapshot updates the panel
-  }
+  apiStatus(u.id, !u.loggedIn);   // server flips it; snapshot updates the panel
+});
+starInfo.jam.addEventListener('click', async () => {
+  const target = selectedUserId;
+  if (target === null || target === sessionUserId || sessionUserId === null) return;
+  starInfo.jam.disabled = true;
+  const res = await apiJam(sessionUserId, target);
+  if (res.cooldownUntil) jamCooldowns.set(target, res.cooldownUntil);
+  refreshAbilityUI();
 });
 
 function showStarInfo() { starInfo.panel.classList.remove('hidden'); updateStarInfo(); }
@@ -1032,17 +1197,102 @@ function updateStarInfo() {
   starInfo.growth.textContent = `+${(u.r - CONFIG.userRadius).toFixed(1)} px`;
   starInfo.pos.textContent = `${u.x.toFixed(0)}, ${u.y.toFixed(0)}`;
   starInfo.born.textContent = new Date(u.createdAt).toLocaleTimeString();
-  
-  const isOwner = currentSession && u.id === currentSession.id;
-  if (isOwner) {
-    starInfo.toggle.classList.remove('read-only');
-    starInfo.toggle.disabled = false;
-    starInfo.toggle.textContent = u.loggedIn ? 'Log out' : 'Log in';
+  // Only the owner can change their star — everyone else sees it read-only.
+  if (u.id === sessionUserId) {
+    starInfo.toggle.style.display = '';
+    starInfo.toggle.textContent = u.loggedIn ? 'Go Dark' : 'Go Live';
   } else {
-    starInfo.toggle.classList.add('read-only');
-    starInfo.toggle.disabled = true;
-    starInfo.toggle.textContent = 'Owned by another user';
+    starInfo.toggle.style.display = 'none';
   }
+
+  // Jam is only for OTHER stars, and only when you're signed in.
+  if (sessionUserId !== null && u.id !== sessionUserId) {
+    starInfo.jam.classList.remove('hidden');
+    const me = getUserById(sessionUserId);
+    const cd = jamCooldowns.get(u.id) || 0;
+    const remaining = cd - Date.now();
+    if (me && !me.loggedIn) {
+      starInfo.jam.disabled = true;
+      starInfo.jam.textContent = 'Go Live to Jam';
+    } else if (remaining > 0) {
+      starInfo.jam.disabled = true;
+      starInfo.jam.textContent = `Jam in ${fmtClock(remaining)}`;
+    } else {
+      starInfo.jam.disabled = false;
+      starInfo.jam.textContent = 'Jam −25%';
+    }
+  } else {
+    starInfo.jam.classList.add('hidden');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Abilities — Heartbeat (self boost). Jam lives in the star panel above.
+// The server is authoritative; boost state is derived from the snapshot's
+// boostAt so it survives reloads.
+// ---------------------------------------------------------------------------
+const heartbeatBtn = document.getElementById('heartbeat-btn');
+
+function fmtClock(ms) {
+  const s = Math.max(0, Math.ceil(ms / 1000));
+  const m = Math.floor(s / 60);
+  const sec = s % 60;
+  return m > 0 ? `${m}:${String(sec).padStart(2, '0')}` : `${sec}s`;
+}
+
+function boostState() {
+  const me = sessionUserId !== null ? getUserById(sessionUserId) : null;
+  if (!me) return { kind: 'none' };
+  const now = Date.now();
+  const at = me.boostAt || 0;
+  if (at && now - at < BOOST_DURATION_MS) return { kind: 'active', until: at + BOOST_DURATION_MS };
+  const readyAt = at ? at + BOOST_COOLDOWN_MS : 0;
+  if (now < readyAt) return { kind: 'cooldown', until: readyAt };
+  return { kind: 'ready' };
+}
+
+function refreshHeartbeat() {
+  if (sessionUserId === null) { heartbeatBtn.classList.add('hidden'); return; }
+  heartbeatBtn.classList.remove('hidden');
+  const me = getUserById(sessionUserId);
+  const st = boostState();
+  const now = Date.now();
+  heartbeatBtn.classList.toggle('boosting', st.kind === 'active');
+  heartbeatBtn.classList.toggle('count', st.kind === 'cooldown');
+  if (!me || !me.loggedIn) {
+    heartbeatBtn.disabled = true;
+    heartbeatBtn.textContent = '⚡';
+    heartbeatBtn.title = 'Go live to use Heartbeat';
+  } else if (st.kind === 'active') {
+    heartbeatBtn.disabled = true;
+    heartbeatBtn.textContent = '⚡';
+    heartbeatBtn.title = `Boosting — ${fmtClock(st.until - now)} left`;
+  } else if (st.kind === 'cooldown') {
+    heartbeatBtn.disabled = true;
+    heartbeatBtn.textContent = fmtClock(st.until - now);   // mm:ss until ready
+    heartbeatBtn.title = `Heartbeat ready in ${fmtClock(st.until - now)}`;
+  } else {
+    heartbeatBtn.disabled = false;
+    heartbeatBtn.textContent = '⚡';
+    heartbeatBtn.title = 'Heartbeat — boost your pull to 100% for 1 min';
+  }
+}
+
+heartbeatBtn.addEventListener('click', async () => {
+  if (sessionUserId === null) return;
+  heartbeatBtn.disabled = true;
+  const res = await apiBoost(sessionUserId);
+  if (res.ok && res.boostUntil) {
+    const me = getUserById(sessionUserId);
+    if (me) me.boostAt = res.boostUntil - BOOST_DURATION_MS;   // optimistic; snapshot confirms
+  }
+  refreshHeartbeat();
+});
+
+// One entry point the session/snapshot code can poke to keep buttons in sync.
+function refreshAbilityUI() {
+  refreshHeartbeat();
+  if (selectedUserId !== null) updateStarInfo();
 }
 
 // ---------------------------------------------------------------------------
