@@ -388,6 +388,79 @@ html, body {
   max-width: min(80vw, 360px);
 }
 #session-bar.hidden { display: none; }
+.session-sound {
+  flex: none;
+  width: 30px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  line-height: 1;
+  color: var(--hud-fg);
+  background: rgba(159, 231, 255, 0.1);
+  border: 1px solid rgba(159, 231, 255, 0.25);
+  border-radius: 50%;
+  cursor: pointer;
+}
+.session-sound:hover { background: rgba(159, 231, 255, 0.2); }
+.session-sound.muted { opacity: 0.6; }
+
+/* Toast notifications (bottom-centre, above the hint) */
+#toasts {
+  position: absolute;
+  left: 50%;
+  bottom: 54px;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  z-index: 20;
+  pointer-events: none;
+  max-width: 90vw;
+}
+.toast {
+  pointer-events: auto;
+  max-width: 90vw;
+  padding: 10px 16px;
+  border-radius: 999px;
+  font-size: 13px;
+  letter-spacing: 0.02em;
+  color: #eafaff;
+  background: rgba(8, 16, 26, 0.9);
+  border: 1px solid rgba(159, 231, 255, 0.3);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(6px);
+  opacity: 0;
+  transform: translateY(10px);
+  transition: opacity 0.25s ease, transform 0.25s ease;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.toast.show { opacity: 1; transform: translateY(0); }
+.toast-jam {
+  color: #ffe0e0;
+  border-color: rgba(255, 120, 120, 0.65);
+  background: rgba(46, 10, 14, 0.92);
+}
+
+/* Red vignette flashed briefly when a jam lands on your star */
+#screen-flash {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 15;
+  opacity: 0;
+  box-shadow: inset 0 0 110px 34px rgba(255, 50, 70, 0.55);
+}
+#screen-flash.flash { animation: sf 0.7s ease; }
+@keyframes sf {
+  0% { opacity: 0; }
+  18% { opacity: 1; }
+  100% { opacity: 0; }
+}
 .session-label {
   white-space: nowrap;
   overflow: hidden;
@@ -472,6 +545,7 @@ html, body {
 
 .si-online { color: #7CFF9B; }
 .si-offline { color: #8aa0ad; }
+.si-jammed { color: #ff8a8a; }
 
 .si-toggle {
   width: 100%;

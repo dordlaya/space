@@ -12,9 +12,15 @@
 
     <!-- Top session bar: who you're signed in as + global Log Out -->
     <div id="session-bar" class="hidden">
+      <button id="sound-toggle" class="session-sound" title="Toggle sounds">🔊</button>
       <span id="session-label" class="session-label"></span>
       <button id="logout-btn" class="session-logout">Log Out</button>
     </div>
+
+    <!-- Transient notifications (e.g. "you were jammed") -->
+    <div id="toasts"></div>
+    <!-- Red vignette flashed on a jam hit -->
+    <div id="screen-flash"></div>
 
     <!-- Login page: join a user; each join drops a planet (server-authoritative) -->
     <div id="login" class="hidden">

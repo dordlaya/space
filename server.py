@@ -508,6 +508,9 @@ class Sim:
             # and {attacker_id: activated_at_ms} for jams landed on this star.
             "boostAt": 0,
             "jams": {},
+            # Last jam landed on this star (drives the victim's notification).
+            "lastJamAt": 0,
+            "lastJamBy": "",
         }
 
     def register(self, name, email, password):
@@ -620,6 +623,8 @@ class Sim:
             return {"ok": False, "error": "cooldown",
                     "cooldownUntil": last + JAM_COOLDOWN_MS}
         target["jams"][attacker_id] = now
+        target["lastJamAt"] = now             # stamp so the victim gets notified
+        target["lastJamBy"] = attacker["name"]
         self.rev += 1                         # reflect the reduced pull promptly
         return {"ok": True,
                 "jamUntil": now + JAM_DURATION_MS,
@@ -823,6 +828,7 @@ class Sim:
                 "loggedIn": u["loggedIn"], "pull": round(u["pullForce"], 3),
                 "pulse": round(u["pulse"], 3), "createdAt": u["createdAt"],
                 "sector": u["sector"], "boostAt": u["boostAt"],
+                "lastJamAt": u["lastJamAt"], "lastJamBy": u["lastJamBy"],
             } for u in self.users]
         return snap
 
@@ -975,6 +981,18 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Space Map (authoritative)", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def revalidate_app_assets(request, call_next):
+    """Serve index.html/main.js/style.css with Cache-Control: no-cache so browsers
+    always revalidate (cheap 304 via ETag) and pick up a redeploy immediately,
+    instead of silently running a stale cached bundle."""
+    resp = await call_next(request)
+    path = request.url.path
+    if path == "/" or path.endswith((".html", ".js", ".css")):
+        resp.headers["Cache-Control"] = "no-cache"
+    return resp
 
 
 class RegisterReq(BaseModel):

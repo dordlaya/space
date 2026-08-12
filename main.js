@@ -251,8 +251,12 @@ let sessionUserName = null;
 // The server stays the sole authority; these are for display only.
 const BOOST_DURATION_MS = 60_000;      // Heartbeat: 100% pull for 1 min...
 const BOOST_COOLDOWN_MS = 600_000;     // ...then locked for the rest of 10 min
+const JAM_ACTIVE_MS = 60_000;          // a jam visibly bites for 1 min (display)
 // Per-target jam cooldown expiry (ms epoch) from the server, keyed by target id.
 const jamCooldowns = new Map();
+// The last jam timestamp we've already notified about for our own star.
+// null = baseline not set yet (so we don't alert for a jam that predates login).
+let myLastJamAt = null;
 
 function getUserById(id) { return users.find((u) => u.id === id) || null; }
 
@@ -271,7 +275,21 @@ function applySnapshot(snap) {
       id: s.id, name: s.name, x: s.x, y: s.y, r: s.r, hits: s.hits,
       loggedIn: s.loggedIn, pullForce: s.pull, pulse: s.pulse,
       createdAt: s.createdAt, sector: s.sector, boostAt: s.boostAt || 0,
+      lastJamAt: s.lastJamAt || 0, lastJamBy: s.lastJamBy || '',
     }));
+
+    // Did my own star just get jammed? Notify on the rising edge of lastJamAt.
+    if (sessionUserId !== null) {
+      const me = users.find((u) => u.id === sessionUserId);
+      if (me) {
+        if (myLastJamAt === null) {
+          myLastJamAt = me.lastJamAt;         // baseline; don't alert for old jams
+        } else if (me.lastJamAt > myLastJamAt) {
+          myLastJamAt = me.lastJamAt;
+          onJammed(me.lastJamBy || 'someone');
+        }
+      }
+    }
   }
 
   // Probes: keep display objects across snapshots so we can interpolate + trail.
@@ -1073,6 +1091,7 @@ const sessionBar = {
   bar: document.getElementById('session-bar'),
   label: document.getElementById('session-label'),
   logout: document.getElementById('logout-btn'),
+  sound: document.getElementById('sound-toggle'),
 };
 
 function loadSession() {
@@ -1085,6 +1104,7 @@ function loadSession() {
 function setSession(id, name) {
   sessionUserId = id;
   sessionUserName = name;
+  myLastJamAt = null;   // re-baseline jam alerts for the new identity
   try { localStorage.setItem(SESSION_KEY, JSON.stringify({ id, name })); } catch { /* ignore */ }
   refreshSessionBar();
   refreshHeartbeat();
@@ -1093,6 +1113,7 @@ function setSession(id, name) {
 function clearSession() {
   sessionUserId = null;
   sessionUserName = null;
+  myLastJamAt = null;
   try { localStorage.removeItem(SESSION_KEY); } catch { /* ignore */ }
   refreshSessionBar();
   refreshHeartbeat();
@@ -1135,6 +1156,94 @@ if (savedSession) {
 }
 
 // ---------------------------------------------------------------------------
+// Notifications & sound — toast + red flash + WebAudio tones (no asset files).
+// ---------------------------------------------------------------------------
+const SOUND_KEY = 'spacemap.sound';
+let soundEnabled = true;
+try { soundEnabled = localStorage.getItem(SOUND_KEY) !== '0'; } catch { /* ignore */ }
+
+let audioCtx = null;
+function ensureAudio() {
+  if (!soundEnabled) return null;
+  if (!audioCtx) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return null;
+    try { audioCtx = new AC(); } catch { return null; }
+  }
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  return audioCtx;
+}
+// Browsers require a user gesture before audio can start — resume on first input.
+window.addEventListener('pointerdown', () => {
+  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+}, { passive: true });
+
+function playTone({ freq = 440, dur = 0.15, type = 'sine', gain = 0.2, slideTo = null, delay = 0 }) {
+  const ctx = ensureAudio();
+  if (!ctx) return;
+  const t0 = ctx.currentTime + delay;
+  const osc = ctx.createOscillator();
+  const g = ctx.createGain();
+  osc.type = type;
+  osc.frequency.setValueAtTime(freq, t0);
+  if (slideTo) osc.frequency.exponentialRampToValueAtTime(slideTo, t0 + dur);
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.exponentialRampToValueAtTime(gain, t0 + 0.012);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  osc.connect(g).connect(ctx.destination);
+  osc.start(t0);
+  osc.stop(t0 + dur + 0.03);
+}
+function soundJammed() {
+  // Two-tone descending "alarm".
+  playTone({ freq: 660, slideTo: 220, dur: 0.28, type: 'sawtooth', gain: 0.22 });
+  playTone({ freq: 440, slideTo: 150, dur: 0.34, type: 'square', gain: 0.12, delay: 0.13 });
+}
+function soundCast() {
+  // Soft confirm blip when you fire an ability.
+  playTone({ freq: 520, slideTo: 780, dur: 0.12, type: 'triangle', gain: 0.14 });
+}
+
+const toasts = document.getElementById('toasts');
+function showToast(msg, kind = 'info', ms = 5000) {
+  const el = document.createElement('div');
+  el.className = `toast toast-${kind}`;
+  el.textContent = msg;               // textContent — names can't inject markup
+  toasts.appendChild(el);
+  requestAnimationFrame(() => el.classList.add('show'));
+  setTimeout(() => {
+    el.classList.remove('show');
+    setTimeout(() => el.remove(), 300);
+  }, ms);
+}
+
+const screenFlash = document.getElementById('screen-flash');
+function flashScreen() {
+  screenFlash.classList.remove('flash');
+  void screenFlash.offsetWidth;       // reflow so the animation can re-trigger
+  screenFlash.classList.add('flash');
+}
+
+function onJammed(byName) {
+  showToast(`⚡ Jammed by ${byName} — pull −25% for 60s`, 'jam');
+  flashScreen();
+  soundJammed();
+}
+
+function refreshSoundToggle() {
+  sessionBar.sound.textContent = soundEnabled ? '🔊' : '🔇';
+  sessionBar.sound.classList.toggle('muted', !soundEnabled);
+  sessionBar.sound.title = soundEnabled ? 'Sounds on — click to mute' : 'Muted — click to unmute';
+}
+sessionBar.sound.addEventListener('click', () => {
+  soundEnabled = !soundEnabled;
+  try { localStorage.setItem(SOUND_KEY, soundEnabled ? '1' : '0'); } catch { /* ignore */ }
+  refreshSoundToggle();
+  if (soundEnabled) soundCast();      // brief confirmation that audio is on
+});
+refreshSoundToggle();
+
+// ---------------------------------------------------------------------------
 // Star info panel
 // ---------------------------------------------------------------------------
 const starInfo = {
@@ -1166,6 +1275,7 @@ starInfo.jam.addEventListener('click', async () => {
   starInfo.jam.disabled = true;
   const res = await apiJam(sessionUserId, target);
   if (res.cooldownUntil) jamCooldowns.set(target, res.cooldownUntil);
+  if (res.ok) soundCast();
   refreshAbilityUI();
 });
 
@@ -1188,8 +1298,9 @@ function updateStarInfo() {
   if (!u) { selectedUserId = null; hideStarInfo(); return; }
   starInfo.name.textContent = u.name;
   starInfo.sector.textContent = sectorName(u.sector);
-  starInfo.status.textContent = u.loggedIn ? 'online' : 'offline';
-  starInfo.status.className = u.loggedIn ? 'si-online' : 'si-offline';
+  const jammed = (u.lastJamAt || 0) > 0 && (Date.now() - u.lastJamAt) < JAM_ACTIVE_MS;
+  starInfo.status.textContent = (u.loggedIn ? 'online' : 'offline') + (jammed ? ' · jammed' : '');
+  starInfo.status.className = jammed ? 'si-jammed' : (u.loggedIn ? 'si-online' : 'si-offline');
   starInfo.pull.textContent = `${Math.round(u.pullForce * 100)}%`;
   starInfo.age.textContent = formatDuration(Date.now() - u.createdAt);
   starInfo.absorbed.textContent = String(u.hits);
@@ -1285,6 +1396,7 @@ heartbeatBtn.addEventListener('click', async () => {
   if (res.ok && res.boostUntil) {
     const me = getUserById(sessionUserId);
     if (me) me.boostAt = res.boostUntil - BOOST_DURATION_MS;   // optimistic; snapshot confirms
+    soundCast();
   }
   refreshHeartbeat();
 });
